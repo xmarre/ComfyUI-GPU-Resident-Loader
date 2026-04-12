@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from typing import Any
 
 import folder_paths
@@ -12,7 +13,7 @@ import comfy.utils
 from comfy.cli_args import PerformanceFeature, args
 from comfy.ldm.modules.attention import attention_pytorch, wrap_attn
 
-from .residency import KIND_CHECKPOINT, KIND_CLIP, KIND_MODEL, KIND_VAE, REGISTRY
+from .residency import KIND_CHECKPOINT, KIND_CLIP, KIND_MODEL, KIND_VAE, POLICIES, REGISTRY
 
 
 _LOG = logging.getLogger(__name__)
@@ -244,6 +245,57 @@ def _build_model_options(weight_dtype: str) -> dict[str, Any]:
     return model_options
 
 
+def _normalize_optional_string(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _normalize_optional_policy(value: str | None) -> str | None:
+    normalized = _normalize_optional_string(value)
+    return None if normalized is None else normalized.lower()
+
+
+def _resolve_loader_policy_and_extra_state_dict(
+    *,
+    loader_name: str,
+    policy_override: str | None,
+    extra_state_dict: str | None,
+) -> tuple[str | None, str | None]:
+    normalized_policy = _normalize_optional_policy(policy_override)
+    if normalized_policy is not None and normalized_policy not in POLICIES:
+        raise ValueError(
+            f"{loader_name}: unsupported policy_override {normalized_policy!r}. "
+            f"Expected one of: {', '.join(POLICIES)}."
+        )
+
+    normalized_extra = _normalize_optional_string(extra_state_dict)
+    if normalized_extra is None:
+        return normalized_policy, None
+
+    if normalized_policy is None and normalized_extra.lower() in POLICIES and not os.path.exists(normalized_extra):
+        _LOG.warning(
+            "GPU Resident Loader: interpreting legacy extra_state_dict value %r as policy_override for %s",
+            normalized_extra,
+            loader_name,
+        )
+        return normalized_extra.lower(), None
+
+    if not os.path.isfile(normalized_extra):
+        raise FileNotFoundError(
+            f"{loader_name}: extra_state_dict must point to an existing state-dict file, got {normalized_extra!r}. "
+            f"If you meant to pass a residency policy, connect that STRING to policy_override instead."
+        )
+
+    return normalized_policy, normalized_extra
+
+
+def _apply_policy_override(policy_override: str | None) -> None:
+    if policy_override is not None:
+        REGISTRY.set_policy(policy_override)
+
+
 class DiffusionModelSelectorResident:
     @classmethod
     def INPUT_TYPES(cls):
@@ -306,6 +358,13 @@ class DiffusionModelLoaderResident:
                         "forceInput": True,
                         "tooltip": "Optional absolute path to a second state dict merged into the main diffusion state dict before model detection.",
                     },
+                ),
+                "policy_override": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Optional residency policy override. Connect Set Global Residency Policy here, not to extra_state_dict.",
+                    },
                 )
             },
         }
@@ -328,7 +387,15 @@ class DiffusionModelLoaderResident:
         sage_attention: str,
         enable_fp16_accumulation: bool,
         extra_state_dict: str | None = None,
+        policy_override: str | None = None,
     ):
+        policy_override, extra_state_dict = _resolve_loader_policy_and_extra_state_dict(
+            loader_name="Diffusion Model Loader Resident",
+            policy_override=policy_override,
+            extra_state_dict=extra_state_dict,
+        )
+        _apply_policy_override(policy_override)
+
         with _temporary_backend_flags(
             cublas=patch_cublaslinear,
             fp16_accumulation=enable_fp16_accumulation,
@@ -378,7 +445,16 @@ class CheckpointLoaderResident:
                     "BOOLEAN",
                     {"default": False, "tooltip": "Set torch.backends.cuda.matmul.allow_fp16_accumulation."},
                 ),
-            }
+            },
+            "optional": {
+                "policy_override": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Optional residency policy override. Connect Set Global Residency Policy here.",
+                    },
+                )
+            },
         }
 
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
@@ -397,7 +473,15 @@ class CheckpointLoaderResident:
         patch_cublaslinear: bool,
         sage_attention: str,
         enable_fp16_accumulation: bool,
+        policy_override: str | None = None,
     ):
+        policy_override, _ = _resolve_loader_policy_and_extra_state_dict(
+            loader_name="Checkpoint Loader Resident",
+            policy_override=policy_override,
+            extra_state_dict=None,
+        )
+        _apply_policy_override(policy_override)
+
         with _temporary_backend_flags(
             cublas=patch_cublaslinear,
             fp16_accumulation=enable_fp16_accumulation,
