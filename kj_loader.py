@@ -37,6 +37,13 @@ DTYPE_MAP = {
     "fp32": torch.float32,
 }
 
+UNET_PREFIX_CANDIDATES = (
+    "model.diffusion_model.",
+    "model.model.",
+    "net.",
+    "model.",
+)
+
 
 def _set_cublas_linear(enabled: bool) -> None:
     if enabled:
@@ -291,18 +298,38 @@ def _resolve_loader_policy_and_extra_state_dict(
     return normalized_policy, normalized_extra
 
 
-def _extract_unet_state_dict(sd: dict[str, Any], *, known_unet_keys: set[str] | None = None) -> dict[str, Any]:
-    diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
-    extracted = comfy.utils.state_dict_prefix_replace(dict(sd), {diffusion_model_prefix: ""}, filter_keys=True)
+def _extract_unet_state_dict(
+    sd: dict[str, Any],
+    *,
+    diffusion_model_prefix: str | None = None,
+    known_unet_keys: set[str] | None = None,
+) -> dict[str, Any]:
     if known_unet_keys is None:
-        if not extracted:
-            return dict(sd)
-        return extracted
+        if diffusion_model_prefix is None:
+            diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
+        if diffusion_model_prefix:
+            extracted = comfy.utils.state_dict_prefix_replace(dict(sd), {diffusion_model_prefix: ""}, filter_keys=True)
+            if extracted:
+                return extracted
+        return dict(sd)
 
-    if extracted:
-        extracted = {key: value for key, value in extracted.items() if key in known_unet_keys}
-    else:
-        extracted = {}
+    prefixes_to_try: list[str] = []
+
+    def add_prefix(prefix: str | None) -> None:
+        if prefix and prefix not in prefixes_to_try:
+            prefixes_to_try.append(prefix)
+
+    add_prefix(diffusion_model_prefix)
+    add_prefix(comfy.sd.model_detection.unet_prefix_from_state_dict(sd))
+    for prefix in UNET_PREFIX_CANDIDATES:
+        add_prefix(prefix)
+
+    extracted: dict[str, Any] = {}
+    for prefix in prefixes_to_try:
+        stripped = comfy.utils.state_dict_prefix_replace(dict(sd), {prefix: ""}, filter_keys=True)
+        for key, value in stripped.items():
+            if key in known_unet_keys:
+                extracted[key] = value
 
     for key, value in sd.items():
         if key in known_unet_keys:
@@ -438,10 +465,17 @@ class DiffusionModelLoaderResident:
 
                 with REGISTRY.load_context(kind=KIND_MODEL, source_path=unet_path, explicit_device=explicit_device):
                     sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
-                    sd = _extract_unet_state_dict(sd)
+                    diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
+                    sd = _extract_unet_state_dict(sd, diffusion_model_prefix=diffusion_model_prefix)
                     if extra_state_dict:
                         extra_sd = comfy.utils.load_torch_file(extra_state_dict)
-                        sd.update(_extract_unet_state_dict(extra_sd, known_unet_keys=set(sd)))
+                        sd.update(
+                            _extract_unet_state_dict(
+                                extra_sd,
+                                diffusion_model_prefix=diffusion_model_prefix,
+                                known_unet_keys=set(sd),
+                            )
+                        )
                         del extra_sd
 
                 model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
