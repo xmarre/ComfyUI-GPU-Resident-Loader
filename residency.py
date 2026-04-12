@@ -255,9 +255,11 @@ class ResidencyRegistry:
             raise ValueError("Cannot bind None into residency registry")
 
         with self._lock:
+            old_key: tuple[str, str] | None = None
             entry_id = getattr(obj, "__gpu_resident_loader_entry_id__", None)
             if entry_id is not None and entry_id in self._entries:
                 entry = self._entries[entry_id]
+                old_key = (entry.kind, entry.source_path)
             else:
                 entry_id = self._make_entry_id(kind, source_path)
                 entry = ResidencyEntry(
@@ -290,6 +292,11 @@ class ResidencyRegistry:
             entry.priority = int(priority)
             entry.source_path = source_path
             entry.kind = kind
+            new_key = (entry.kind, entry.source_path)
+            if old_key is not None and old_key != new_key:
+                if self._path_to_entry.get(old_key) == entry_id:
+                    self._path_to_entry.pop(old_key, None)
+            self._path_to_entry[new_key] = entry_id
             entry.last_touched = _now()
             if note:
                 entry.notes.append(note)
@@ -358,12 +365,14 @@ class ResidencyRegistry:
                 obj = entry.object()
                 if obj is None:
                     continue
+                entry.loaded_bytes = 0
                 load_device = getattr(obj, "load_device", None)
                 offload_device = getattr(obj, "offload_device", None)
                 if load_device is not None:
                     entry.load_device = str(load_device)
                 if offload_device is not None:
                     entry.offload_device = str(offload_device)
+                entry.current_device = entry.offload_device
 
             for loaded in list(model_management.current_loaded_models):
                 entry = self.entry_for_object(loaded.model)

@@ -49,8 +49,13 @@ def _safe_open_device_arg(device: torch.device) -> Any:
     return device.type
 
 
-def _copy_tensor_if_needed(tensor: torch.Tensor, target_device: torch.device) -> torch.Tensor:
-    if tensor.device == target_device:
+def _copy_tensor_if_needed(
+    tensor: torch.Tensor,
+    target_device: torch.device,
+    *,
+    force_copy: bool = False,
+) -> torch.Tensor:
+    if tensor.device == target_device and not force_copy:
         return tensor
     return tensor.to(device=target_device, copy=True)
 
@@ -119,7 +124,7 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
                 for key in handle.keys():
                     tensor = handle.get_tensor(key)
                     if getattr(comfy_utils, "DISABLE_MMAP", False) and tensor.device.type == "cpu":
-                        tensor = _copy_tensor_if_needed(tensor, requested_device)
+                        tensor = _copy_tensor_if_needed(tensor, requested_device, force_copy=True)
                     sd[key] = tensor
                 if return_metadata:
                     metadata = handle.metadata()
