@@ -291,9 +291,22 @@ def _resolve_loader_policy_and_extra_state_dict(
     return normalized_policy, normalized_extra
 
 
-def _apply_policy_override(policy_override: str | None) -> None:
-    if policy_override is not None:
-        REGISTRY.set_policy(policy_override)
+@contextlib.contextmanager
+def _apply_policy_override(policy_override: str | None):
+    if policy_override is None:
+        yield
+        return
+
+    previous_policy = REGISTRY.get_policy()
+    if previous_policy == policy_override:
+        yield
+        return
+
+    REGISTRY.set_policy(policy_override)
+    try:
+        yield
+    finally:
+        REGISTRY.set_policy(previous_policy)
 
 
 class DiffusionModelSelectorResident:
@@ -394,29 +407,29 @@ class DiffusionModelLoaderResident:
             policy_override=policy_override,
             extra_state_dict=extra_state_dict,
         )
-        _apply_policy_override(policy_override)
 
-        with _temporary_backend_flags(
-            cublas=patch_cublaslinear,
-            fp16_accumulation=enable_fp16_accumulation,
-        ):
-            model_options = _build_model_options(weight_dtype)
-            unet_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
-            explicit_device = REGISTRY.explicit_load_device(kind=KIND_MODEL, source_path=unet_path)
+        with _apply_policy_override(policy_override):
+            with _temporary_backend_flags(
+                cublas=patch_cublaslinear,
+                fp16_accumulation=enable_fp16_accumulation,
+            ):
+                model_options = _build_model_options(weight_dtype)
+                unet_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+                explicit_device = REGISTRY.explicit_load_device(kind=KIND_MODEL, source_path=unet_path)
 
-            with REGISTRY.load_context(kind=KIND_MODEL, source_path=unet_path, explicit_device=explicit_device):
-                sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
-                if extra_state_dict:
-                    extra_sd = comfy.utils.load_torch_file(extra_state_dict)
-                    sd.update(extra_sd)
-                    del extra_sd
+                with REGISTRY.load_context(kind=KIND_MODEL, source_path=unet_path, explicit_device=explicit_device):
+                    sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+                    if extra_state_dict:
+                        extra_sd = comfy.utils.load_torch_file(extra_state_dict)
+                        sd.update(extra_sd)
+                        del extra_sd
 
-            diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
-            sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=False)
-            model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
-            _apply_model_postload_options(model, compute_dtype=compute_dtype, sage_attention=sage_attention)
-        REGISTRY.bind_object(model, source_path=unet_path, kind=KIND_MODEL)
-        return (model,)
+                diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
+                sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=False)
+                model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
+                _apply_model_postload_options(model, compute_dtype=compute_dtype, sage_attention=sage_attention)
+            REGISTRY.bind_object(model, source_path=unet_path, kind=KIND_MODEL)
+            return (model,)
 
 
 class CheckpointLoaderResident:
@@ -480,31 +493,31 @@ class CheckpointLoaderResident:
             policy_override=policy_override,
             extra_state_dict=None,
         )
-        _apply_policy_override(policy_override)
 
-        with _temporary_backend_flags(
-            cublas=patch_cublaslinear,
-            fp16_accumulation=enable_fp16_accumulation,
-        ):
-            model_options = _build_model_options(weight_dtype)
-            ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
-            explicit_device = REGISTRY.explicit_load_device(kind=KIND_CHECKPOINT, source_path=ckpt_path)
+        with _apply_policy_override(policy_override):
+            with _temporary_backend_flags(
+                cublas=patch_cublaslinear,
+                fp16_accumulation=enable_fp16_accumulation,
+            ):
+                model_options = _build_model_options(weight_dtype)
+                ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+                explicit_device = REGISTRY.explicit_load_device(kind=KIND_CHECKPOINT, source_path=ckpt_path)
 
-            with REGISTRY.load_context(kind=KIND_CHECKPOINT, source_path=ckpt_path, explicit_device=explicit_device):
-                sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
+                with REGISTRY.load_context(kind=KIND_CHECKPOINT, source_path=ckpt_path, explicit_device=explicit_device):
+                    sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
 
-            model, clip, vae, _ = comfy.sd.load_state_dict_guess_config(
-                sd,
-                output_vae=True,
-                output_clip=True,
-                embedding_directory=folder_paths.get_folder_paths("embeddings"),
-                metadata=metadata,
-                model_options=model_options,
-            )
-            _apply_model_postload_options(model, compute_dtype=compute_dtype, sage_attention=sage_attention)
-        REGISTRY.bind_object(model, source_path=ckpt_path, kind=KIND_MODEL, note="checkpoint model")
-        if clip is not None and getattr(clip, "patcher", None) is not None:
-            REGISTRY.bind_object(clip.patcher, source_path=ckpt_path, kind=KIND_CLIP, note="checkpoint clip")
-        if vae is not None and getattr(vae, "patcher", None) is not None:
-            REGISTRY.bind_object(vae.patcher, source_path=ckpt_path, kind=KIND_VAE, note="checkpoint vae")
-        return model, clip, vae
+                model, clip, vae, _ = comfy.sd.load_state_dict_guess_config(
+                    sd,
+                    output_vae=True,
+                    output_clip=True,
+                    embedding_directory=folder_paths.get_folder_paths("embeddings"),
+                    metadata=metadata,
+                    model_options=model_options,
+                )
+                _apply_model_postload_options(model, compute_dtype=compute_dtype, sage_attention=sage_attention)
+            REGISTRY.bind_object(model, source_path=ckpt_path, kind=KIND_MODEL, note="checkpoint model")
+            if clip is not None and getattr(clip, "patcher", None) is not None:
+                REGISTRY.bind_object(clip.patcher, source_path=ckpt_path, kind=KIND_CLIP, note="checkpoint clip")
+            if vae is not None and getattr(vae, "patcher", None) is not None:
+                REGISTRY.bind_object(vae.patcher, source_path=ckpt_path, kind=KIND_VAE, note="checkpoint vae")
+            return model, clip, vae
