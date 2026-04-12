@@ -11,7 +11,7 @@ import comfy.utils
 from comfy.cli_args import PerformanceFeature, args
 from comfy.ldm.modules.attention import attention_pytorch, wrap_attn
 
-from .residency import KIND_CHECKPOINT, KIND_MODEL, REGISTRY
+from .residency import KIND_CHECKPOINT, KIND_CLIP, KIND_MODEL, KIND_VAE, REGISTRY
 
 
 _LOG = logging.getLogger(__name__)
@@ -44,12 +44,28 @@ def _set_cublas_linear(enabled: bool) -> None:
 
 
 def _set_fp16_accumulation(enabled: bool) -> None:
+    if not hasattr(torch.backends.cuda, "matmul"):
+        if enabled:
+            raise RuntimeError(
+                "Failed to enable fp16 accumulation. This requires a PyTorch build exposing "
+                "torch.backends.cuda.matmul.allow_fp16_accumulation."
+            )
+        _LOG.warning(
+            "GPU Resident Loader: fp16 accumulation toggle is unavailable on this PyTorch build; leaving default behavior."
+        )
+        return
+
     flag = getattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", None)
     if flag is None:
-        raise RuntimeError(
-            "Failed to set fp16 accumulation. This requires a PyTorch build exposing "
-            "torch.backends.cuda.matmul.allow_fp16_accumulation."
+        if enabled:
+            raise RuntimeError(
+                "Failed to enable fp16 accumulation. This requires a PyTorch build exposing "
+                "torch.backends.cuda.matmul.allow_fp16_accumulation."
+            )
+        _LOG.warning(
+            "GPU Resident Loader: fp16 accumulation toggle is unavailable on this PyTorch build; leaving default behavior."
         )
+        return
     torch.backends.cuda.matmul.allow_fp16_accumulation = bool(enabled)
 
 

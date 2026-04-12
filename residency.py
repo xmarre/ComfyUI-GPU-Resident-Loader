@@ -271,10 +271,21 @@ class ResidencyRegistry:
                 self._path_to_entry[(kind, source_path)] = entry_id
                 try:
                     setattr(obj, "__gpu_resident_loader_entry_id__", entry_id)
-                except Exception:
-                    pass
+                except (AttributeError, TypeError):
+                    _LOG.debug(
+                        "GPU Resident Loader: could not tag object %r with residency entry id %s",
+                        type(obj),
+                        entry_id,
+                    )
 
-            entry.object_ref = weakref.ref(obj)
+            try:
+                entry.object_ref = weakref.ref(obj)
+            except TypeError:
+                entry.object_ref = None
+                _LOG.debug(
+                    "GPU Resident Loader: object %r is not weak-referenceable; tracking metadata only",
+                    type(obj),
+                )
             entry.sticky = entry.sticky if sticky is None else bool(sticky)
             entry.priority = int(priority)
             entry.source_path = source_path

@@ -5,8 +5,8 @@ from typing import Any
 
 import comfy.model_management as model_management
 
-from kj_loader import CheckpointLoaderResident, DiffusionModelLoaderResident, DiffusionModelSelectorResident
-from residency import REGISTRY
+from .kj_loader import CheckpointLoaderResident, DiffusionModelLoaderResident, DiffusionModelSelectorResident
+from .residency import REGISTRY
 
 
 def _entry_report_json(obj: Any) -> str:
@@ -133,6 +133,8 @@ class PinClipResidency:
 
     def pin(self, clip, sticky: bool, priority: int):
         patcher = _patcher_for_clip(clip)
+        if patcher is None:
+            raise RuntimeError("Expected a CLIP object with a patcher, but no patcher was found.")
         REGISTRY.set_sticky(patcher, sticky=sticky, priority=priority)
         return (clip,)
 
@@ -154,6 +156,8 @@ class PinVAEResidency:
 
     def pin(self, vae, sticky: bool, priority: int):
         patcher = _patcher_for_vae(vae)
+        if patcher is None:
+            raise RuntimeError("Expected a VAE object with a patcher, but no patcher was found.")
         REGISTRY.set_sticky(patcher, sticky=sticky, priority=priority)
         return (vae,)
 

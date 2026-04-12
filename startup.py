@@ -1,6 +1,6 @@
 import logging
 
-from patches import install_patches as _install_patches
+from .patches import install_patches as _install_patches
 
 _LOG = logging.getLogger(__name__)
 _PATCHES_INSTALLED = False
