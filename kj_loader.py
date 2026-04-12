@@ -291,6 +291,25 @@ def _resolve_loader_policy_and_extra_state_dict(
     return normalized_policy, normalized_extra
 
 
+def _extract_unet_state_dict(sd: dict[str, Any], *, known_unet_keys: set[str] | None = None) -> dict[str, Any]:
+    diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
+    extracted = comfy.utils.state_dict_prefix_replace(dict(sd), {diffusion_model_prefix: ""}, filter_keys=True)
+    if known_unet_keys is None:
+        if not extracted:
+            return dict(sd)
+        return extracted
+
+    if extracted:
+        extracted = {key: value for key, value in extracted.items() if key in known_unet_keys}
+    else:
+        extracted = {}
+
+    for key, value in sd.items():
+        if key in known_unet_keys:
+            extracted[key] = value
+    return extracted
+
+
 @contextlib.contextmanager
 def _apply_policy_override(policy_override: str | None):
     if policy_override is None:
@@ -419,13 +438,12 @@ class DiffusionModelLoaderResident:
 
                 with REGISTRY.load_context(kind=KIND_MODEL, source_path=unet_path, explicit_device=explicit_device):
                     sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+                    sd = _extract_unet_state_dict(sd)
                     if extra_state_dict:
                         extra_sd = comfy.utils.load_torch_file(extra_state_dict)
-                        sd.update(extra_sd)
+                        sd.update(_extract_unet_state_dict(extra_sd, known_unet_keys=set(sd)))
                         del extra_sd
 
-                diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
-                sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=False)
                 model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
                 _apply_model_postload_options(model, compute_dtype=compute_dtype, sage_attention=sage_attention)
             REGISTRY.bind_object(model, source_path=unet_path, kind=KIND_MODEL)
