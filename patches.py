@@ -22,6 +22,7 @@ from .residency import (
 _LOG = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINALS: dict[str, Callable[..., Any]] = {}
+_METADATA_CPU_KEY_SUFFIXES = ("spiece_model", "tekken_model", "comfy_quant")
 
 
 def _normalize_device(device: Any | None) -> torch.device | None:
@@ -58,6 +59,38 @@ def _copy_tensor_if_needed(
     if tensor.device == target_device and not force_copy:
         return tensor
     return tensor.to(device=target_device, copy=True)
+
+
+def _tensor_key_requires_cpu(key: str) -> bool:
+    return key.endswith(_METADATA_CPU_KEY_SUFFIXES)
+
+
+def _prepare_loaded_tensor(
+    key: str,
+    tensor: torch.Tensor,
+    requested_device: torch.device,
+    *,
+    disable_mmap: bool,
+) -> torch.Tensor:
+    if _tensor_key_requires_cpu(key):
+        return _copy_tensor_if_needed(tensor, torch.device("cpu"))
+
+    if disable_mmap and tensor.device.type == "cpu":
+        return _copy_tensor_if_needed(tensor, requested_device, force_copy=True)
+
+    return tensor
+
+
+def _state_dict_device_summary(sd: dict[str, Any], requested_device: torch.device) -> str:
+    devices: set[str] = set()
+    for value in sd.values():
+        if torch.is_tensor(value):
+            devices.add(str(value.device))
+    if not devices:
+        return str(requested_device)
+    if len(devices) == 1:
+        return next(iter(devices))
+    return ", ".join(sorted(devices))
 
 
 def _resolved_context(kind: str, source_path: str | None) -> tuple[torch.device | None, str, str | None]:
@@ -121,15 +154,19 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
             safe_device = _safe_open_device_arg(requested_device)
             with safe_open(ckpt, framework="pt", device=safe_device) as handle:
                 sd = {}
+                disable_mmap = getattr(comfy_utils, "DISABLE_MMAP", False)
                 for key in handle.keys():
                     tensor = handle.get_tensor(key)
-                    if getattr(comfy_utils, "DISABLE_MMAP", False) and tensor.device.type == "cpu":
-                        tensor = _copy_tensor_if_needed(tensor, requested_device, force_copy=True)
-                    sd[key] = tensor
+                    sd[key] = _prepare_loaded_tensor(
+                        key,
+                        tensor,
+                        requested_device,
+                        disable_mmap=disable_mmap,
+                    )
                 if return_metadata:
                     metadata = handle.metadata()
 
-            actual_device = str(next(iter(sd.values())).device) if sd else str(requested_device)
+            actual_device = _state_dict_device_summary(sd, requested_device)
             method = "safetensors_gpu_direct" if requested_device.type == "cuda" else "safetensors_cpu"
             _record_generic_load(
                 path=ckpt,
@@ -149,14 +186,19 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
                     with safe_open(ckpt, framework="pt", device="cpu") as handle:
                         sd = {}
                         for key in handle.keys():
-                            sd[key] = handle.get_tensor(key).to(requested_device)
+                            sd[key] = _prepare_loaded_tensor(
+                                key,
+                                handle.get_tensor(key).to(requested_device),
+                                requested_device,
+                                disable_mmap=False,
+                            )
                         if return_metadata:
                             metadata = handle.metadata()
                     _record_generic_load(
                         path=ckpt,
                         method="safetensors_cpu_then_copy_to_cuda",
                         requested_device=requested_device,
-                        actual_device=str(requested_device),
+                        actual_device=_state_dict_device_summary(sd, requested_device),
                         error=str(exc),
                     )
                     return (sd, metadata) if return_metadata else sd
@@ -199,14 +241,6 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
         torch_args["mmap"] = True
 
     pl_sd = torch.load(ckpt, map_location=requested_device, weights_only=True, **torch_args)
-    method = "torch_load_cpu_first_to_cuda" if requested_device.type == "cuda" else "torch_load_cpu"
-    _record_generic_load(
-        path=ckpt,
-        method=method,
-        requested_device=requested_device,
-        actual_device=str(requested_device),
-    )
-
     if "state_dict" in pl_sd:
         sd = pl_sd["state_dict"]
     else:
@@ -217,6 +251,24 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
                 sd = pl_sd
         else:
             sd = pl_sd
+
+    if isinstance(sd, dict):
+        for key, value in list(sd.items()):
+            if torch.is_tensor(value):
+                sd[key] = _prepare_loaded_tensor(
+                    key,
+                    value,
+                    requested_device,
+                    disable_mmap=False,
+                )
+
+    method = "torch_load_cpu_first_to_cuda" if requested_device.type == "cuda" else "torch_load_cpu"
+    _record_generic_load(
+        path=ckpt,
+        method=method,
+        requested_device=requested_device,
+        actual_device=_state_dict_device_summary(sd, requested_device) if isinstance(sd, dict) else str(requested_device),
+    )
     return (sd, metadata) if return_metadata else sd
 
 
