@@ -240,7 +240,8 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
     if getattr(comfy_utils, "MMAP_TORCH_FILES", False):
         torch_args["mmap"] = True
 
-    pl_sd = torch.load(ckpt, map_location=requested_device, weights_only=True, **torch_args)
+    torch_load_device = torch.device("cpu") if requested_device.type == "cuda" else requested_device
+    pl_sd = torch.load(ckpt, map_location=torch_load_device, weights_only=True, **torch_args)
     if "state_dict" in pl_sd:
         sd = pl_sd["state_dict"]
     else:
