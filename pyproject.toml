@@ -1,0 +1,19 @@
+[project]
+name = "comfyui-gpu-resident-loader"
+version = "0.1.0"
+description = "ComfyUI custom nodes and startup patches for GPU-resident model loading and sticky VRAM residency"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.10"
+dependencies = [
+  "safetensors>=0.4.3",
+]
+
+[tool.setuptools]
+py-modules = [
+  "startup",
+  "patches",
+  "residency",
+  "kj_loader",
+  "nodes",
+]
