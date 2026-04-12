@@ -129,13 +129,13 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
                 if return_metadata:
                     metadata = handle.metadata()
 
-            actual_device = next(iter(sd.values())).device.type if sd else requested_device.type
+            actual_device = str(next(iter(sd.values())).device) if sd else str(requested_device)
             method = "safetensors_gpu_direct" if requested_device.type == "cuda" else "safetensors_cpu"
             _record_generic_load(
                 path=ckpt,
                 method=method,
                 requested_device=requested_device,
-                actual_device=str(actual_device),
+                actual_device=actual_device,
             )
             return (sd, metadata) if return_metadata else sd
         except Exception as exc:

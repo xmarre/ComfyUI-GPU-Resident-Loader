@@ -120,6 +120,7 @@ class ResidencyRegistry:
         self._entries: dict[str, ResidencyEntry] = {}
         self._reports_by_path: dict[str, LoadReport] = {}
         self._path_to_entry: dict[tuple[str, str], str] = {}
+        self._object_to_entry: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
         self._policy = self._default_policy()
 
     def _default_policy(self) -> str:
@@ -257,6 +258,11 @@ class ResidencyRegistry:
         with self._lock:
             old_key: tuple[str, str] | None = None
             entry_id = getattr(obj, "__gpu_resident_loader_entry_id__", None)
+            if entry_id is None:
+                try:
+                    entry_id = self._object_to_entry.get(obj)
+                except TypeError:
+                    entry_id = None
             if entry_id is not None and entry_id in self._entries:
                 entry = self._entries[entry_id]
                 old_key = (entry.kind, entry.source_path)
@@ -273,6 +279,10 @@ class ResidencyRegistry:
                 self._path_to_entry[(kind, source_path)] = entry_id
                 try:
                     setattr(obj, "__gpu_resident_loader_entry_id__", entry_id)
+                    try:
+                        self._object_to_entry.pop(obj, None)
+                    except TypeError:
+                        pass
                 except (AttributeError, TypeError):
                     _LOG.debug(
                         "GPU Resident Loader: could not tag object %r with residency entry id %s",
@@ -282,6 +292,11 @@ class ResidencyRegistry:
 
             try:
                 entry.object_ref = weakref.ref(obj)
+                if getattr(obj, "__gpu_resident_loader_entry_id__", None) is None:
+                    try:
+                        self._object_to_entry[obj] = entry_id
+                    except TypeError:
+                        pass
             except TypeError:
                 entry.object_ref = None
                 _LOG.debug(
@@ -313,6 +328,11 @@ class ResidencyRegistry:
         if obj is None:
             return None
         entry_id = getattr(obj, "__gpu_resident_loader_entry_id__", None)
+        if entry_id is None:
+            try:
+                entry_id = self._object_to_entry.get(obj)
+            except TypeError:
+                entry_id = None
         if entry_id is None:
             return None
         with self._lock:
