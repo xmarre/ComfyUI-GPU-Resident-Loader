@@ -40,6 +40,7 @@ class LoadContext:
     source_path: str | None = None
     explicit_device: torch.device | None = None
     note: str | None = None
+    cache_key: str | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -82,14 +83,19 @@ class ResidencyEntry:
     current_device: str | None = None
     last_method: str | None = None
     last_report: dict[str, Any] | None = None
+    loader_key: str | None = None
     notes: list[str] = dataclasses.field(default_factory=list)
     object_ref: weakref.ReferenceType[Any] | None = None
+    cached_object_ref: weakref.ReferenceType[Any] | None = None
 
     def is_alive(self) -> bool:
         return self.object_ref is not None and self.object_ref() is not None
 
     def object(self) -> Any | None:
         return None if self.object_ref is None else self.object_ref()
+
+    def cached_object(self) -> Any | None:
+        return None if self.cached_object_ref is None else self.cached_object_ref()
 
     def as_dict(self) -> dict[str, Any]:
         basename = os.path.basename(self.source_path) if self.source_path else None
@@ -109,6 +115,7 @@ class ResidencyEntry:
             "current_device": self.current_device,
             "last_method": self.last_method,
             "last_report": self.last_report,
+            "loader_key": self.loader_key,
             "notes": list(self.notes),
             "alive": self.is_alive(),
         }
@@ -120,8 +127,36 @@ class ResidencyRegistry:
         self._entries: dict[str, ResidencyEntry] = {}
         self._reports_by_path: dict[str, LoadReport] = {}
         self._path_to_entry: dict[tuple[str, str], str] = {}
+        self._loader_key_to_entry: dict[tuple[str, str, str], str] = {}
         self._object_to_entry: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
         self._policy = self._default_policy()
+
+    def _gpu_ingest_kinds(self, policy: str) -> set[str]:
+        if policy in {"prefer_gpu", "sticky_gpu"}:
+            return {KIND_MODEL, KIND_CHECKPOINT, KIND_CLIP, KIND_VAE, KIND_CONTROLNET, KIND_CLIP_VISION}
+        return set()
+
+    def _gpu_offload_kinds(self, policy: str) -> set[str]:
+        if policy == "sticky_gpu":
+            return {KIND_MODEL, KIND_CLIP, KIND_VAE, KIND_CONTROLNET}
+        if policy == "prefer_gpu":
+            return {KIND_MODEL, KIND_CLIP, KIND_CONTROLNET}
+        return set()
+
+    def _autopin_kinds(self, policy: str) -> set[str]:
+        if policy == "sticky_gpu":
+            return {KIND_MODEL, KIND_CLIP}
+        return set()
+
+    def default_priority(self, kind: str) -> int:
+        return {
+            KIND_MODEL: 300,
+            KIND_CHECKPOINT: 300,
+            KIND_CONTROLNET: 200,
+            KIND_CLIP: 150,
+            KIND_VAE: 100,
+            KIND_CLIP_VISION: 50,
+        }.get(kind, 0)
 
     def _default_policy(self) -> str:
         env_value = os.environ.get("COMFYUI_GPU_RESIDENT_POLICY", "").strip().lower()
@@ -154,14 +189,21 @@ class ResidencyRegistry:
 
     def wants_gpu_ingest(self, kind: str | None = None) -> bool:
         policy = self.get_policy()
-        return policy in {"prefer_gpu", "sticky_gpu"}
+        if kind is None:
+            return bool(self._gpu_ingest_kinds(policy))
+        return kind in self._gpu_ingest_kinds(policy)
 
     def wants_gpu_offload(self, kind: str | None = None) -> bool:
         policy = self.get_policy()
-        return policy in {"prefer_gpu", "sticky_gpu"}
+        if kind is None:
+            return bool(self._gpu_offload_kinds(policy))
+        return kind in self._gpu_offload_kinds(policy)
 
     def autopin_on_bind(self, kind: str | None = None) -> bool:
-        return self.get_policy() == "sticky_gpu"
+        policy = self.get_policy()
+        if kind is None:
+            return bool(self._autopin_kinds(policy))
+        return kind in self._autopin_kinds(policy)
 
     def explicit_load_device(self, kind: str, source_path: str | None = None) -> torch.device | None:
         if not self.wants_gpu_ingest(kind):
@@ -183,6 +225,7 @@ class ResidencyRegistry:
         source_path: str | None = None,
         explicit_device: torch.device | None = None,
         note: str | None = None,
+        cache_key: str | None = None,
     ) -> Iterator[None]:
         token = _LOAD_CONTEXT.set(
             LoadContext(
@@ -190,6 +233,7 @@ class ResidencyRegistry:
                 source_path=source_path,
                 explicit_device=explicit_device,
                 note=note,
+                cache_key=cache_key,
             )
         )
         try:
@@ -222,7 +266,12 @@ class ResidencyRegistry:
         )
         with self._lock:
             self._reports_by_path[path] = report
-            entry_id = self._path_to_entry.get((kind, path))
+            entry_id = None
+            ctx = self.current_context()
+            if ctx is not None and ctx.cache_key is not None:
+                entry_id = self._loader_key_to_entry.get((kind, path, ctx.cache_key))
+            if entry_id is None:
+                entry_id = self._path_to_entry.get((kind, path))
             if entry_id is not None:
                 entry = self._entries.get(entry_id)
                 if entry is not None:
@@ -249,15 +298,20 @@ class ResidencyRegistry:
         source_path: str,
         kind: str,
         sticky: bool | None = None,
-        priority: int = 0,
+        priority: int | None = None,
         note: str | None = None,
+        loader_key: str | None = None,
+        reusable_obj: Any | None = None,
     ) -> ResidencyEntry:
         if obj is None:
             raise ValueError("Cannot bind None into residency registry")
 
         with self._lock:
             old_key: tuple[str, str] | None = None
-            entry_id = getattr(obj, "__gpu_resident_loader_entry_id__", None)
+            old_loader_key: tuple[str, str, str] | None = None
+            entry_id = self._loader_key_to_entry.get((kind, source_path, loader_key)) if loader_key is not None else None
+            if entry_id is None:
+                entry_id = getattr(obj, "__gpu_resident_loader_entry_id__", None)
             if entry_id is None:
                 try:
                     entry_id = self._object_to_entry.get(obj)
@@ -266,6 +320,8 @@ class ResidencyRegistry:
             if entry_id is not None and entry_id in self._entries:
                 entry = self._entries[entry_id]
                 old_key = (entry.kind, entry.source_path)
+                if entry.loader_key is not None:
+                    old_loader_key = (entry.kind, entry.source_path, entry.loader_key)
             else:
                 entry_id = self._make_entry_id(kind, source_path)
                 entry = ResidencyEntry(
@@ -273,7 +329,7 @@ class ResidencyRegistry:
                     kind=kind,
                     source_path=source_path,
                     sticky=self.autopin_on_bind(kind) if sticky is None else bool(sticky),
-                    priority=int(priority),
+                    priority=self.default_priority(kind) if priority is None else int(priority),
                 )
                 self._entries[entry_id] = entry
                 self._path_to_entry[(kind, source_path)] = entry_id
@@ -303,15 +359,27 @@ class ResidencyRegistry:
                     "GPU Resident Loader: object %r is not weak-referenceable; tracking metadata only",
                     type(obj),
                 )
+            cache_obj = obj if reusable_obj is None else reusable_obj
+            try:
+                entry.cached_object_ref = weakref.ref(cache_obj)
+            except TypeError:
+                entry.cached_object_ref = entry.object_ref
             entry.sticky = entry.sticky if sticky is None else bool(sticky)
-            entry.priority = int(priority)
+            entry.priority = entry.priority if priority is None else int(priority)
             entry.source_path = source_path
             entry.kind = kind
+            entry.loader_key = loader_key
             new_key = (entry.kind, entry.source_path)
+            new_loader_key = (entry.kind, entry.source_path, entry.loader_key) if entry.loader_key is not None else None
             if old_key is not None and old_key != new_key:
                 if self._path_to_entry.get(old_key) == entry_id:
                     self._path_to_entry.pop(old_key, None)
             self._path_to_entry[new_key] = entry_id
+            if old_loader_key is not None and old_loader_key != new_loader_key:
+                if self._loader_key_to_entry.get(old_loader_key) == entry_id:
+                    self._loader_key_to_entry.pop(old_loader_key, None)
+            if new_loader_key is not None:
+                self._loader_key_to_entry[new_loader_key] = entry_id
             entry.last_touched = _now()
             if note:
                 entry.notes.append(note)
@@ -321,8 +389,23 @@ class ResidencyRegistry:
                 entry.last_report = report.as_dict()
                 entry.current_device = report.actual_device
 
-        self.refresh_runtime_state()
         return entry
+
+    def lookup_live_object(self, *, kind: str, source_path: str, loader_key: str) -> Any | None:
+        with self._lock:
+            entry_id = self._loader_key_to_entry.get((kind, source_path, loader_key))
+            if entry_id is None:
+                return None
+            entry = self._entries.get(entry_id)
+            if entry is None:
+                return None
+            obj = entry.cached_object()
+            if obj is None:
+                obj = entry.object()
+            if obj is None:
+                return None
+            entry.last_touched = _now()
+            return obj
 
     def entry_for_object(self, obj: Any) -> ResidencyEntry | None:
         if obj is None:
@@ -369,8 +452,9 @@ class ResidencyRegistry:
                     continue
                 entry = self.entry_for_object(loaded.model)
                 if entry is not None and entry.sticky:
-                    output.append(loaded)
-        return output
+                    output.append((entry.priority, entry.last_touched, loaded))
+        output.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in output]
 
     def refresh_runtime_state(self) -> None:
         try:
