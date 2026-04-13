@@ -16,7 +16,7 @@ Stock ComfyUI makes separate decisions for:
 
 Those are not the same thing.
 
-This repo targets the second problem directly for `.safetensors` by steering eligible loads toward direct GPU ingest, then targets the first problem by overriding offload policy and by teaching `free_memory()` to respect sticky entries until the VRAM budget is actually exceeded.
+This repo targets the second problem directly for `.safetensors` by steering eligible loads toward direct GPU ingest, narrowing resident diffusion-model loads down to UNet tensors only, then targets the first problem by overriding offload policy and by teaching `free_memory()` to protect high-priority sticky entries until the VRAM budget says otherwise.
 
 ## What is included
 
@@ -46,6 +46,9 @@ Current patch surface:
 
 - **Diffusion Model Loader Resident**
 - **Checkpoint Loader Resident**
+- **Checkpoint Model Loader Resident**
+- **Checkpoint Clip Loader Resident**
+- **Checkpoint VAE Loader Resident**
 - **Diffusion Model Selector Resident**
 
 `Diffusion Model Loader Resident` mirrors the relevant KJ diffusion-loader feature surface:
@@ -56,6 +59,8 @@ Current patch surface:
 - SageAttention override
 - fp16 accumulation toggle
 - optional extra-state-dict merge
+
+On `.safetensors`, the resident diffusion-model path now reads only the detected UNet keys and merges only matching keys from any extra state dict. Repeated resident loads also reuse a live equivalent object when the source path and loader-relevant options still match.
 
 ### Residency nodes
 
@@ -72,8 +77,8 @@ The startup patcher exposes four policies:
 
 - `legacy` — leave ingest/offload behavior close to stock ComfyUI.
 - `balanced` — keep the registry and diagnostics, but do not aggressively steer ingest to GPU.
-- `prefer_gpu` — prefer GPU ingest and GPU offload devices, but do not auto-pin tracked objects.
-- `sticky_gpu` — prefer GPU ingest, prefer GPU offload devices, and auto-mark tracked loader outputs sticky.
+- `prefer_gpu` — prefer GPU ingest, keep UNet/ControlNet/CLIP on the faster side of the device policy, but do not auto-pin tracked objects.
+- `sticky_gpu` — prefer GPU ingest, auto-pin the highest-value tracked outputs, and let lower-priority sticky entries yield first when VRAM pressure rises.
 
 Default selection order:
 
@@ -88,11 +93,11 @@ Default selection order:
 
 This repo is optimized around `.safetensors`.
 
-Direct GPU ingest is attempted for `.safetensors` loads. If the direct path fails, the patcher falls back to CPU read + GPU copy and records that fallback in the registry.
+Direct GPU ingest is attempted for `.safetensors` loads. Resident diffusion-model loads take a header-first selective path and fetch only the detected UNet tensors instead of loading the whole file and filtering later. If the direct path fails, the patcher falls back to CPU read + GPU copy and records that fallback in the registry.
 
 ### `.ckpt` / `.pt` remain CPU-first under PyTorch
 
-Those formats still go through `torch.load()`. The repo tracks that path and can still keep the resulting model hot in VRAM, but it does **not** claim true direct-to-GPU checkpoint ingest for pickle-based formats.
+Those formats still go through `torch.load()`. The repo tracks that path and can still keep the resulting model hot in VRAM, but it does **not** claim true direct-to-GPU checkpoint ingest for pickle-based formats. Resident checkpoint nodes now warn about this when a GPU-resident policy is active so the compatibility path is not mistaken for the fast path.
 
 Use the included conversion helper to migrate hot models to `.safetensors`.
 
@@ -133,7 +138,17 @@ Recommended on a large VRAM machine:
 
 Use **Checkpoint Loader Resident**.
 
-That tracks and binds the resulting diffusion model, CLIP, and VAE independently so they appear in the registry snapshot.
+That tracks and binds the resulting diffusion model, CLIP, and VAE independently so they appear in the registry snapshot. If an equivalent live model, CLIP, or VAE already exists, the loader reuses it instead of rebuilding it.
+
+### For staged checkpoint loads
+
+Use:
+
+- **Checkpoint Model Loader Resident** when the workflow only needs the diffusion model
+- **Checkpoint Clip Loader Resident** when the workflow only needs the text encoder
+- **Checkpoint VAE Loader Resident** when the workflow only needs the VAE
+
+The model-only checkpoint node takes the same selective safetensors UNet fast path as the diffusion-model loader. CLIP-only and VAE-only nodes still use ComfyUI's checkpoint construction logic, but they avoid materializing the other outputs and can reuse an already-live equivalent object.
 
 ### For manual residency control
 

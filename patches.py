@@ -23,6 +23,8 @@ _LOG = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINALS: dict[str, Callable[..., Any]] = {}
 _METADATA_CPU_KEY_SUFFIXES = ("spiece_model", "tekken_model", "comfy_quant")
+_UNET_PREFIX_CANDIDATES = ("model.diffusion_model.", "model.model.", "net.")
+_WARNED_PICKLE_GPU_PATHS: set[str] = set()
 
 
 def _normalize_device(device: Any | None) -> torch.device | None:
@@ -97,6 +99,94 @@ def _state_dict_device_summary(sd: dict[str, Any], requested_device: torch.devic
     return ", ".join(sorted(devices))
 
 
+def _device_summary_from_observed(observed_devices: set[str], requested_device: torch.device) -> str:
+    if not observed_devices:
+        return str(requested_device)
+    if len(observed_devices) == 1:
+        return next(iter(observed_devices))
+    return ", ".join(sorted(observed_devices))
+
+
+def infer_unet_prefix_from_keys(keys: list[str] | tuple[str, ...]) -> str:
+    counts = {candidate: 0 for candidate in _UNET_PREFIX_CANDIDATES}
+    for key in keys:
+        for candidate in _UNET_PREFIX_CANDIDATES:
+            if key.startswith(candidate):
+                counts[candidate] += 1
+                break
+    top = max(counts, key=counts.get)
+    return top if counts[top] > 5 else "model."
+
+
+def load_safetensors_state_dict(
+    ckpt: str,
+    requested_device: torch.device,
+    *,
+    return_metadata: bool = False,
+    selected_keys: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], Any, str, str]:
+    import comfy.memory_management
+    import comfy.utils as comfy_utils
+
+    metadata = None
+    if comfy.memory_management.aimdo_enabled and requested_device.type == "cpu" and selected_keys is None:
+        sd, metadata = comfy_utils.load_safetensors(ckpt)
+        if not return_metadata:
+            metadata = None
+        return sd, metadata, "cpu", "aimdo_cpu"
+
+    disable_mmap = getattr(comfy_utils, "DISABLE_MMAP", False)
+
+    def read_handle(device_arg: Any, *, move_to_requested_device: bool) -> tuple[dict[str, Any], Any, str]:
+        observed_devices: set[str] = set()
+        with safe_open(ckpt, framework="pt", device=device_arg) as handle:
+            key_map = selected_keys if selected_keys is not None else {key: key for key in handle.keys()}
+            sd: dict[str, Any] = {}
+            for source_key, target_key in key_map.items():
+                tensor = handle.get_tensor(source_key)
+                loaded = _prepare_loaded_tensor(
+                    source_key,
+                    tensor,
+                    requested_device,
+                    disable_mmap=disable_mmap,
+                    move_to_requested_device=move_to_requested_device,
+                )
+                sd[target_key] = loaded
+                if torch.is_tensor(loaded):
+                    observed_devices.add(str(loaded.device))
+            handle_metadata = handle.metadata() if return_metadata else None
+        return sd, handle_metadata, _device_summary_from_observed(observed_devices, requested_device)
+
+    try:
+        safe_device = _safe_open_device_arg(requested_device)
+        sd, metadata, actual_device = read_handle(safe_device, move_to_requested_device=False)
+        return sd, metadata, actual_device, "direct"
+    except Exception as exc:
+        if requested_device.type == "cuda":
+            _LOG.warning(
+                "GPU Resident Loader: direct GPU safetensors load failed for %s; falling back to CPU path: %s",
+                ckpt,
+                exc,
+            )
+            try:
+                sd, metadata, actual_device = read_handle("cpu", move_to_requested_device=True)
+                return sd, metadata, actual_device, "cpu_then_copy"
+            except Exception as fallback_exc:
+                raise fallback_exc from exc
+        raise
+
+
+def _warn_pickle_gpu_compatibility(path: str, requested_device: torch.device) -> None:
+    if requested_device.type != "cuda" or path in _WARNED_PICKLE_GPU_PATHS:
+        return
+    _WARNED_PICKLE_GPU_PATHS.add(path)
+    _LOG.warning(
+        "GPU Resident Loader: %s is not a safetensors file, so GPU-resident loading still goes through CPU-first torch.load(). "
+        "Convert hot models with scripts/convert_checkpoint_to_safetensors.py for the narrow fast path.",
+        path,
+    )
+
+
 def _resolved_context(kind: str, source_path: str | None) -> tuple[torch.device | None, str, str | None]:
     ctx = REGISTRY.current_context()
     if ctx is not None and ctx.explicit_device is not None:
@@ -142,36 +232,30 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
 
     if lowered.endswith((".safetensors", ".sft")):
         try:
-            if comfy.memory_management.aimdo_enabled and requested_device.type == "cpu":
-                sd, metadata = comfy_utils.load_safetensors(ckpt)
+            selected_keys = None
+            if ctx is not None and ctx.kind == KIND_MODEL:
+                with safe_open(ckpt, framework="pt", device="cpu") as handle:
+                    all_keys = list(handle.keys())
+                prefix = infer_unet_prefix_from_keys(all_keys)
+                candidate_keys = {key: key[len(prefix):] for key in all_keys if key.startswith(prefix)}
+                selected_keys = candidate_keys or None
+
+            sd, metadata, actual_device, load_mode = load_safetensors_state_dict(
+                ckpt,
+                requested_device,
+                return_metadata=return_metadata,
+                selected_keys=selected_keys,
+            )
+            if load_mode == "aimdo_cpu":
                 method = "safetensors_aimdo_cpu"
-                if not return_metadata:
-                    metadata = None
-                _record_generic_load(
-                    path=ckpt,
-                    method=method,
-                    requested_device=requested_device,
-                    actual_device="cpu",
+            elif selected_keys is not None:
+                method = "safetensors_cpu_then_copy_to_cuda_model_only" if load_mode == "cpu_then_copy" else (
+                    "safetensors_gpu_direct_model_only" if requested_device.type == "cuda" else "safetensors_cpu_model_only"
                 )
-                return (sd, metadata) if return_metadata else sd
-
-            safe_device = _safe_open_device_arg(requested_device)
-            with safe_open(ckpt, framework="pt", device=safe_device) as handle:
-                sd = {}
-                disable_mmap = getattr(comfy_utils, "DISABLE_MMAP", False)
-                for key in handle.keys():
-                    tensor = handle.get_tensor(key)
-                    sd[key] = _prepare_loaded_tensor(
-                        key,
-                        tensor,
-                        requested_device,
-                        disable_mmap=disable_mmap,
-                    )
-                if return_metadata:
-                    metadata = handle.metadata()
-
-            actual_device = _state_dict_device_summary(sd, requested_device)
-            method = "safetensors_gpu_direct" if requested_device.type == "cuda" else "safetensors_cpu"
+            else:
+                method = "safetensors_cpu_then_copy_to_cuda" if load_mode == "cpu_then_copy" else (
+                    "safetensors_gpu_direct" if requested_device.type == "cuda" else "safetensors_cpu"
+                )
             _record_generic_load(
                 path=ckpt,
                 method=method,
@@ -180,43 +264,6 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
             )
             return (sd, metadata) if return_metadata else sd
         except Exception as exc:
-            if requested_device.type == "cuda":
-                _LOG.warning(
-                    "GPU Resident Loader: direct GPU safetensors load failed for %s; falling back to CPU path: %s",
-                    ckpt,
-                    exc,
-                )
-                try:
-                    with safe_open(ckpt, framework="pt", device="cpu") as handle:
-                        sd = {}
-                        for key in handle.keys():
-                            sd[key] = _prepare_loaded_tensor(
-                                key,
-                                handle.get_tensor(key),
-                                requested_device,
-                                disable_mmap=False,
-                                move_to_requested_device=True,
-                            )
-                        if return_metadata:
-                            metadata = handle.metadata()
-                    _record_generic_load(
-                        path=ckpt,
-                        method="safetensors_cpu_then_copy_to_cuda",
-                        requested_device=requested_device,
-                        actual_device=_state_dict_device_summary(sd, requested_device),
-                        error=str(exc),
-                    )
-                    return (sd, metadata) if return_metadata else sd
-                except Exception as fallback_exc:
-                    _record_generic_load(
-                        path=ckpt,
-                        method="safetensors_cpu_fallback_failed",
-                        requested_device=requested_device,
-                        actual_device="error",
-                        error=str(fallback_exc),
-                    )
-                    raise fallback_exc from exc
-
             if len(getattr(exc, "args", ())) > 0:
                 message = exc.args[0]
                 if isinstance(message, str):
@@ -245,6 +292,7 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
     if getattr(comfy_utils, "MMAP_TORCH_FILES", False):
         torch_args["mmap"] = True
 
+    _warn_pickle_gpu_compatibility(ckpt, requested_device)
     torch_load_device = torch.device("cpu") if requested_device.type == "cuda" else requested_device
     pl_sd = torch.load(ckpt, map_location=torch_load_device, weights_only=True, **torch_args)
     if "state_dict" in pl_sd:
@@ -367,18 +415,31 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
         if REGISTRY.get_policy() == "sticky_gpu":
             sticky_wrappers = [w for w in REGISTRY.sticky_loaded_wrappers(device) if w not in keep_loaded]
 
-        unloaded = func(memory_required, device, keep_loaded + sticky_wrappers, *args, **kwargs)
-
+        protected_wrappers: list[Any] = []
         if device is not None and sticky_wrappers:
             try:
-                free_after = model_management.get_free_memory(device)
+                free_now = model_management.get_free_memory(device)
             except Exception:
-                free_after = None
-            if free_after is not None and free_after < memory_required:
-                _LOG.warning(
-                    "GPU Resident Loader: sticky set exceeded VRAM budget; allowing fallback eviction to satisfy request"
+                free_now = None
+            if free_now is None:
+                protected_wrappers = sticky_wrappers
+            else:
+                unloadable_wrappers = []
+                for loaded in list(model_management.current_loaded_models):
+                    if loaded.device == device and loaded not in keep_loaded and not loaded.is_dead():
+                        unloadable_wrappers.append(loaded)
+                available_for_protection = max(
+                    0,
+                    free_now + sum(max(0, loaded.model_loaded_memory()) for loaded in unloadable_wrappers) - memory_required,
                 )
-                unloaded = func(memory_required, device, keep_loaded, *args, **kwargs)
+                protected_memory = 0
+                for loaded in sticky_wrappers:
+                    estimated_memory = max(0, loaded.model_loaded_memory())
+                    if protected_memory + estimated_memory <= available_for_protection:
+                        protected_wrappers.append(loaded)
+                        protected_memory += estimated_memory
+
+        unloaded = func(memory_required, device, keep_loaded + protected_wrappers, *args, **kwargs)
 
         REGISTRY.refresh_runtime_state()
         return unloaded
@@ -393,6 +454,15 @@ def _remember_original(key: str, value: Callable[..., Any]) -> Callable[..., Any
 def _patch_model_management_devices() -> None:
     import comfy.model_management as model_management
 
+    kind_by_function = {
+        "unet_offload_device": KIND_MODEL,
+        "unet_inital_load_device": KIND_MODEL,
+        "text_encoder_offload_device": KIND_CLIP,
+        "text_encoder_device": KIND_CLIP,
+        "vae_offload_device": KIND_VAE,
+        "vae_device": KIND_VAE,
+    }
+
     def wrap_device_func(name: str) -> None:
         key = f"model_management.{name}"
         original = _remember_original(key, getattr(model_management, name))
@@ -402,7 +472,8 @@ def _patch_model_management_devices() -> None:
         @functools.wraps(original)
         def wrapper(*args, **kwargs):
             result = original(*args, **kwargs)
-            if not REGISTRY.wants_gpu_offload(name):
+            kind = kind_by_function.get(name)
+            if not REGISTRY.wants_gpu_offload(kind):
                 return result
             gpu_device = model_management.get_torch_device()
             if getattr(gpu_device, "type", None) == "cpu":

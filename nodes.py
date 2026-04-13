@@ -5,7 +5,14 @@ from typing import Any
 
 import comfy.model_management as model_management
 
-from .kj_loader import CheckpointLoaderResident, DiffusionModelLoaderResident, DiffusionModelSelectorResident
+from .kj_loader import (
+    CheckpointClipLoaderResident,
+    CheckpointLoaderResident,
+    CheckpointModelLoaderResident,
+    CheckpointVAELoaderResident,
+    DiffusionModelLoaderResident,
+    DiffusionModelSelectorResident,
+)
 from .residency import REGISTRY
 
 
@@ -328,6 +335,9 @@ NODE_CLASS_MAPPINGS = {
     "DiffusionModelSelectorResident": DiffusionModelSelectorResident,
     "DiffusionModelLoaderResident": DiffusionModelLoaderResident,
     "CheckpointLoaderResident": CheckpointLoaderResident,
+    "CheckpointModelLoaderResident": CheckpointModelLoaderResident,
+    "CheckpointClipLoaderResident": CheckpointClipLoaderResident,
+    "CheckpointVAELoaderResident": CheckpointVAELoaderResident,
     "SetGlobalResidencyPolicy": SetGlobalResidencyPolicy,
     "RegistrySnapshot": RegistrySnapshot,
     "PinModelResidency": PinModelResidency,
@@ -348,6 +358,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DiffusionModelSelectorResident": "Diffusion Model Selector Resident",
     "DiffusionModelLoaderResident": "Diffusion Model Loader Resident",
     "CheckpointLoaderResident": "Checkpoint Loader Resident",
+    "CheckpointModelLoaderResident": "Checkpoint Model Loader Resident",
+    "CheckpointClipLoaderResident": "Checkpoint Clip Loader Resident",
+    "CheckpointVAELoaderResident": "Checkpoint VAE Loader Resident",
     "SetGlobalResidencyPolicy": "Set Global Residency Policy",
     "RegistrySnapshot": "Registry Snapshot",
     "PinModelResidency": "Pin Model Residency",
