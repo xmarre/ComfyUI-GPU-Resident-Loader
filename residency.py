@@ -270,7 +270,7 @@ class ResidencyRegistry:
             ctx = self.current_context()
             if ctx is not None and ctx.cache_key is not None:
                 entry_id = self._loader_key_to_entry.get((kind, path, ctx.cache_key))
-            if entry_id is None:
+            else:
                 entry_id = self._path_to_entry.get((kind, path))
             if entry_id is not None:
                 entry = self._entries.get(entry_id)
