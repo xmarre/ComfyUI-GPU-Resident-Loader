@@ -554,6 +554,7 @@ def _checkpoint_model_loader_key(
         patch_cublaslinear=patch_cublaslinear,
         sage_attention=sage_attention,
         enable_fp16_accumulation=enable_fp16_accumulation,
+        extra_state_dict=None,
         policy=_effective_policy_name(policy_override),
     )
 
