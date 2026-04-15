@@ -280,7 +280,7 @@ class ExternalResidencyRegistry:
             entry.state_provider = state_provider
             entry.evict_callback = evict_callback
             entry.last_touched = _now()
-            if note:
+            if note and note not in entry.notes:
                 entry.notes.append(note)
 
         self.refresh_runtime_state()
@@ -398,6 +398,11 @@ class ExternalResidencyRegistry:
 EXTERNAL_REGISTRY = ExternalResidencyRegistry()
 
 
+def external_trim_enabled() -> bool:
+    value = os.environ.get("COMFYUI_GPU_RESIDENT_TRIM_EXTERNAL", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _call_seedvr2_method_with_optional_expected_model(
     method: Callable[..., Any],
     *args: Any,
@@ -485,24 +490,32 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
 
     class_id = id(model_cache_cls)
     thread_id = threading.get_ident()
-    with _SEEDVR2_PATCH_CONDITION:
-        while (
-            class_id in _SEEDVR2_PATCHING_CLASS_IDS
-            and _SEEDVR2_PATCHING_THREAD_IDS.get(class_id) != thread_id
-        ):
-            _SEEDVR2_PATCH_CONDITION.wait()
-        if class_id in _SEEDVR2_PATCHED_CLASS_IDS or _SEEDVR2_PATCHING_THREAD_IDS.get(class_id) == thread_id:
-            return True
-        _SEEDVR2_PATCHING_CLASS_IDS.add(class_id)
-        _SEEDVR2_PATCHING_THREAD_IDS[class_id] = thread_id
+    original_set_dit = None
+    original_set_vae = None
+    original_replace_dit = None
+    original_replace_vae = None
+    original_remove_dit = None
+    original_remove_vae = None
+    provisional_cache_keys: set[str] = set()
 
     try:
-        original_set_dit = model_cache_cls.set_dit
-        original_set_vae = model_cache_cls.set_vae
-        original_replace_dit = getattr(model_cache_cls, "replace_dit", None)
-        original_replace_vae = getattr(model_cache_cls, "replace_vae", None)
-        original_remove_dit = model_cache_cls.remove_dit
-        original_remove_vae = model_cache_cls.remove_vae
+        with _SEEDVR2_PATCH_CONDITION:
+            while (
+                class_id in _SEEDVR2_PATCHING_CLASS_IDS
+                and _SEEDVR2_PATCHING_THREAD_IDS.get(class_id) != thread_id
+            ):
+                _SEEDVR2_PATCH_CONDITION.wait()
+            if class_id in _SEEDVR2_PATCHED_CLASS_IDS or _SEEDVR2_PATCHING_THREAD_IDS.get(class_id) == thread_id:
+                return True
+            _SEEDVR2_PATCHING_CLASS_IDS.add(class_id)
+            _SEEDVR2_PATCHING_THREAD_IDS[class_id] = thread_id
+
+            original_set_dit = model_cache_cls.set_dit
+            original_set_vae = model_cache_cls.set_vae
+            original_replace_dit = getattr(model_cache_cls, "replace_dit", None)
+            original_replace_vae = getattr(model_cache_cls, "replace_vae", None)
+            original_remove_dit = model_cache_cls.remove_dit
+            original_remove_vae = model_cache_cls.remove_vae
 
         def set_dit_wrapper(self, dit_config, model, model_name, debug=None):
             result = original_set_dit(self, dit_config, model, model_name, debug)
@@ -570,54 +583,64 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
                 EXTERNAL_REGISTRY.remove(cache_key=_seedvr2_entry_key("vae", vae_config.get("node_id")))
             return result
 
-        model_cache_cls.set_dit = set_dit_wrapper
-        model_cache_cls.set_vae = set_vae_wrapper
-        if original_replace_dit is not None:
-            model_cache_cls.replace_dit = replace_dit_wrapper
-        if original_replace_vae is not None:
-            model_cache_cls.replace_vae = replace_vae_wrapper
-        model_cache_cls.remove_dit = remove_dit_wrapper
-        model_cache_cls.remove_vae = remove_vae_wrapper
         global_cache = get_global_cache()
         model_cache_lock = getattr(global_cache, "_model_cache_lock", None)
         lock_context = model_cache_lock if model_cache_lock is not None else contextlib.nullcontext()
         with lock_context:
             dit_items = list(getattr(global_cache, "_dit_models", {}).items())
             vae_items = list(getattr(global_cache, "_vae_models", {}).items())
-        for node_id, entry in dit_items:
+        for _node_id, entry in dit_items:
             if not isinstance(entry, tuple) or len(entry) != 2:
                 continue
             model, config = entry
             if model is not None:
+                if isinstance(config, Mapping) and config.get("node_id") is not None:
+                    provisional_cache_keys.add(_seedvr2_entry_key("dit", config.get("node_id")))
                 _register_seedvr2_cached_model(global_cache, kind="dit", config=config, model=model)
-        for node_id, entry in vae_items:
+        for _node_id, entry in vae_items:
             if not isinstance(entry, tuple) or len(entry) != 2:
                 continue
             model, config = entry
             if model is not None:
+                if isinstance(config, Mapping) and config.get("node_id") is not None:
+                    provisional_cache_keys.add(_seedvr2_entry_key("vae", config.get("node_id")))
                 _register_seedvr2_cached_model(global_cache, kind="vae", config=config, model=model)
-    except Exception:
         with _SEEDVR2_PATCH_CONDITION:
-            model_cache_cls.set_dit = original_set_dit
-            model_cache_cls.set_vae = original_set_vae
+            model_cache_cls.set_dit = set_dit_wrapper
+            model_cache_cls.set_vae = set_vae_wrapper
+            if original_replace_dit is not None:
+                model_cache_cls.replace_dit = replace_dit_wrapper
+            if original_replace_vae is not None:
+                model_cache_cls.replace_vae = replace_vae_wrapper
+            model_cache_cls.remove_dit = remove_dit_wrapper
+            model_cache_cls.remove_vae = remove_vae_wrapper
+            _SEEDVR2_PATCHING_CLASS_IDS.discard(class_id)
+            _SEEDVR2_PATCHED_CLASS_IDS.add(class_id)
+            _SEEDVR2_PATCHING_THREAD_IDS.pop(class_id, None)
+            _SEEDVR2_PATCH_CONDITION.notify_all()
+    except Exception:
+        for cache_key in provisional_cache_keys:
+            EXTERNAL_REGISTRY.remove(cache_key=cache_key)
+        with _SEEDVR2_PATCH_CONDITION:
+            if original_set_dit is not None:
+                model_cache_cls.set_dit = original_set_dit
+            if original_set_vae is not None:
+                model_cache_cls.set_vae = original_set_vae
             if original_replace_dit is not None:
                 model_cache_cls.replace_dit = original_replace_dit
             if original_replace_vae is not None:
                 model_cache_cls.replace_vae = original_replace_vae
-            model_cache_cls.remove_dit = original_remove_dit
-            model_cache_cls.remove_vae = original_remove_vae
+            if original_remove_dit is not None:
+                model_cache_cls.remove_dit = original_remove_dit
+            if original_remove_vae is not None:
+                model_cache_cls.remove_vae = original_remove_vae
             _SEEDVR2_PATCHING_CLASS_IDS.discard(class_id)
             _SEEDVR2_PATCHED_CLASS_IDS.discard(class_id)
             _SEEDVR2_PATCHING_THREAD_IDS.pop(class_id, None)
             _SEEDVR2_PATCH_CONDITION.notify_all()
         raise
 
-    with _SEEDVR2_PATCH_CONDITION:
-        _SEEDVR2_PATCHING_CLASS_IDS.discard(class_id)
-        _SEEDVR2_PATCHED_CLASS_IDS.add(class_id)
-        _SEEDVR2_PATCHING_THREAD_IDS.pop(class_id, None)
-        _SEEDVR2_PATCH_CONDITION.notify_all()
-    _LOG.info("GPU Resident Loader: integrated external SeedVR2 cache eviction hooks")
+    _LOG.info("GPU Resident Loader: integrated external SeedVR2 cache visibility hooks")
     return True
 
 

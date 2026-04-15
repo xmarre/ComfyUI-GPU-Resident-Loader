@@ -6,7 +6,7 @@ This repo does three related jobs:
 
 1. **Installs startup-time monkey patches** before any workflow nodes run.
 2. Ships **KJ-style resident loader nodes** for diffusion models and checkpoints.
-3. Maintains a **live residency system** for native ComfyUI objects and compatible external caches, with preload / pin / evict / report controls for native tracked objects and automatic snapshot / trim / eviction support for compatible external entries.
+3. Maintains a **live residency system** for native ComfyUI objects and compatible external caches, with preload / pin / evict / report controls for native tracked objects and automatic snapshot support plus provider-specific eviction for compatible external entries.
 
 It is not just a “clean RAM” addon. The main target is the path from model file -> tensors -> live ComfyUI object -> VRAM retention, including GPU-resident caches that live outside ComfyUI’s normal loaded-model list.
 
@@ -24,7 +24,7 @@ This repo focuses on both:
 - For **`.safetensors`**, it tries to keep eligible loads on the narrowest, most GPU-friendly path it can.
 - For **resident diffusion and checkpoint-model loads**, it avoids broad checkpoint materialization by selecting only the detected UNet keys where possible.
 - For **runtime VRAM pressure**, it adds a sticky-priority registry and teaches ComfyUI’s unload path to protect higher-value resident entries until enough VRAM must be reclaimed.
-- For **compatible external GPU caches** that bypass `comfy.model_management.current_loaded_models`, it can discover supported providers at runtime and include their entries in snapshot and trim decisions.
+- For **compatible external GPU caches** that bypass `comfy.model_management.current_loaded_models`, it can discover supported providers at runtime and include their entries in snapshot output and provider-specific eviction decisions, with automatic trim kept opt-in.
 - For **manual control**, it exposes nodes that let you preload, pin, evict, and inspect tracked native models, CLIPs, and VAEs.
 
 ## What changes at startup
@@ -115,8 +115,8 @@ Those entries:
 
 - are refreshed from the live cached object at runtime
 - appear in **Registry Snapshot** output under `external_entries`
-- are considered by load-scoped VRAM trimming even though they are not part of `current_loaded_models`
 - are evicted through SeedVR2’s own cache-removal methods rather than the normal Comfy unload path
+- remain outside automatic trim unless `COMFYUI_GPU_RESIDENT_TRIM_EXTERNAL=1` is set
 
 ### 4) Device/offload policy is overridden
 
@@ -341,7 +341,7 @@ The trim path prefers to:
 - then lower-priority sticky entries
 - preserve explicitly kept models
 - use partial unload where available
-- include compatible external cache entries in the same candidate search when they are visible, on the same device, and not currently claimed/in use
+- include compatible external cache entries in the same candidate search only when `COMFYUI_GPU_RESIDENT_TRIM_EXTERNAL=1`, they are visible, on the same device, and not currently claimed/in use
 
 This logic lives in the resident loader path. You do not need a separate “target free VRAM” node for it.
 
@@ -408,7 +408,7 @@ Typical external-entry fields include:
 - `alive`
 - `external`
 
-For SeedVR2-backed entries, `claimed: true` means the cache object is currently marked in use and is skipped by the automatic trim candidate search.
+For SeedVR2-backed entries, `claimed: true` means the cache object is currently marked in use and is skipped by the external trim candidate search when that opt-in path is enabled.
 
 ## What gets tracked
 
@@ -432,7 +432,7 @@ Current external integration coverage is:
 - SeedVR2 global cached **DiT** entries
 - SeedVR2 global cached **VAE** entries
 
-Those entries are discovered lazily from compatible SeedVR2 cache modules at runtime. They are tracked separately from the native registry and participate in snapshot, load-scoped trim, and provider-specific eviction decisions.
+Those entries are discovered lazily from compatible SeedVR2 cache modules at runtime. They are tracked separately from the native registry and participate in snapshot plus provider-specific eviction decisions, with load-scoped trim available only through the explicit external-trim opt-in.
 
 ## Important limits and non-goals
 
@@ -477,7 +477,7 @@ The native registry only sees objects that pass through the patched ComfyUI load
 
 If another custom node loads models through its own private code path and bypasses those patched entry points, that object may never become a tracked native registry entry. In that case, the preload / pin / evict / report nodes from this repo cannot manage it until that external loader is integrated or patched.
 
-Likewise, even for supported external providers such as SeedVR2, the current external integration is about **observation + automatic trim/eviction**. This repo does **not** yet expose dedicated external preload / pin / report / evict nodes for provider-owned cache entries.
+Likewise, even for supported external providers such as SeedVR2, the current external integration is about **observation + provider-specific eviction**, with automatic trim kept opt-in. This repo does **not** yet expose dedicated external preload / pin / report / evict nodes for provider-owned cache entries.
 
 ## Installation
 
@@ -541,7 +541,7 @@ If SeedVR2 keeps DiT or VAE models in its own global cache, those objects can no
 That means:
 
 - you can see that those bytes exist even though they are outside `current_loaded_models`
-- resident loader trim can reclaim them automatically when they are visible, on the same device, and not currently claimed/in use
+- resident loader trim only reclaims them when `COMFYUI_GPU_RESIDENT_TRIM_EXTERNAL=1`, they are visible, on the same device, and not currently claimed/in use
 - eviction goes through SeedVR2’s own cache-removal path instead of a normal Comfy wrapper unload
 
 ## Notes on compatibility and migration

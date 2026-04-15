@@ -7,7 +7,7 @@ from typing import Any
 import comfy.model_management as model_management
 import torch
 
-from .external_residency import EXTERNAL_REGISTRY, ensure_external_integrations_installed
+from .external_residency import EXTERNAL_REGISTRY, ensure_external_integrations_installed, external_trim_enabled
 from .residency import REGISTRY
 
 _ADAPTIVE_HEADROOM_RATIO = 0.125
@@ -154,13 +154,14 @@ def _trim_candidates(
         )
         candidates.append((loaded, entry, sticky_respected, False))
 
-    for external_obj, entry, sticky_respected in EXTERNAL_REGISTRY.candidates(
-        device=device,
-        respect_sticky=respect_sticky,
-        sticky_floor_priority=sticky_floor_priority,
-        keep_models=keep_models,
-    ):
-        candidates.append((external_obj, entry, sticky_respected, True))
+    if external_trim_enabled():
+        for external_obj, entry, sticky_respected in EXTERNAL_REGISTRY.candidates(
+            device=device,
+            respect_sticky=respect_sticky,
+            sticky_floor_priority=sticky_floor_priority,
+            keep_models=keep_models,
+        ):
+            candidates.append((external_obj, entry, sticky_respected, True))
 
     candidates.sort(key=lambda item: _sort_key_for_candidate(item[1], sticky_respected=item[2]))
     return candidates
@@ -305,6 +306,7 @@ def trim_resident_vram(
         "respect_sticky": bool(respect_sticky),
         "sticky_floor_priority": int(sticky_floor_priority),
         "allow_partial_unload": bool(allow_partial_unload),
+        "external_trim_enabled": bool(external_trim_enabled()),
         "actions": actions,
     }
 
