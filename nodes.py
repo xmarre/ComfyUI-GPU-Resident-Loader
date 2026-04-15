@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import comfy.model_management as model_management
@@ -15,6 +16,8 @@ from .kj_loader import (
     DiffusionModelSelectorResident,
 )
 from .residency import REGISTRY
+
+_LOG = logging.getLogger(__name__)
 
 
 def _entry_report_json(obj: Any) -> str:
@@ -63,14 +66,20 @@ def _evict_patcher(patcher, *, unpatch_weights: bool) -> bool:
         loaded_model = getattr(loaded, "model", None)
         if loaded_model is None:
             continue
-        if loaded_model is patcher or loaded_model.is_clone(patcher):
+        safe_is_clone = False
+        if loaded_model is not patcher:
+            try:
+                safe_is_clone = loaded_model.is_clone(patcher)
+            except Exception as exc:
+                _LOG.warning("GPU Resident Loader: failed to evaluate clone state during eviction: %s", exc)
+        if loaded_model is patcher or safe_is_clone:
             fully_unloaded = unload_loaded_model(
                 loaded,
                 active_device=getattr(loaded, "device", None),
                 force_offload_to_cpu=True,
                 unpatch_weights=unpatch_weights,
             )
-            if fully_unloaded:
+            if fully_unloaded and unpatch_weights:
                 try:
                     model_management.current_loaded_models.remove(loaded)
                 except ValueError:

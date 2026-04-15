@@ -11,7 +11,11 @@ from typing import Any, Callable
 import torch
 from safetensors import safe_open
 
-from .cleanup import unload_loaded_model
+from .cleanup import (
+    _device_matches as _shared_device_matches,
+    _should_force_cpu_offload,
+    unload_loaded_model,
+)
 from .residency import (
     KIND_CHECKPOINT,
     KIND_CLIP,
@@ -222,18 +226,10 @@ def _device_string(device: torch.device | None) -> str:
 
 
 def _devices_match(device_a: Any | None, device_b: Any | None) -> bool:
-    normalized_a = _normalize_device(device_a)
-    normalized_b = _normalize_device(device_b)
-    if normalized_a is not None and normalized_b is not None:
-        return normalized_a == normalized_b
-    return device_a == device_b
+    return _shared_device_matches(device_a, device_b)
 
 
 def _cpu_offload_required(model: Any, loaded_device: Any | None) -> bool:
-    offload_device = _normalize_device(getattr(model, "offload_device", None))
-    if offload_device is None or offload_device.type == "cpu":
-        return False
-
     current_device = None
     if hasattr(model, "current_loaded_device"):
         try:
@@ -242,10 +238,7 @@ def _cpu_offload_required(model: Any, loaded_device: Any | None) -> bool:
             current_device = None
     if current_device is None:
         current_device = _normalize_device(loaded_device)
-    if current_device is None or current_device.type == "cpu":
-        return False
-
-    return _devices_match(offload_device, current_device)
+    return _should_force_cpu_offload(model, active_device=current_device)
 
 
 @contextlib.contextmanager
@@ -643,8 +636,10 @@ def _wrap_load_models_gpu(func: Callable[..., Any]) -> Callable[..., Any]:
                 try:
                     if not requested.is_clone(loaded_model):
                         continue
-                except Exception:
-                    continue
+                except Exception as exc:
+                    raise RuntimeError(
+                        "GPU Resident Loader: failed to evaluate clone-conflict state before replacement"
+                    ) from exc
                 clone_conflicts.append(loaded)
                 seen_loaded_ids.add(id(loaded))
 
