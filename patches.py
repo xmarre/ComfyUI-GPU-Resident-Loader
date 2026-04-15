@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -217,6 +218,51 @@ def _device_string(device: torch.device | None) -> str:
     if device is None:
         return "auto"
     return str(device)
+
+
+def _devices_match(device_a: Any | None, device_b: Any | None) -> bool:
+    normalized_a = _normalize_device(device_a)
+    normalized_b = _normalize_device(device_b)
+    if normalized_a is not None and normalized_b is not None:
+        return normalized_a == normalized_b
+    return device_a == device_b
+
+
+def _cpu_offload_required(model: Any, loaded_device: Any | None) -> bool:
+    offload_device = _normalize_device(getattr(model, "offload_device", None))
+    if offload_device is None or offload_device.type == "cpu":
+        return False
+
+    current_device = None
+    if hasattr(model, "current_loaded_device"):
+        try:
+            current_device = _normalize_device(model.current_loaded_device())
+        except Exception:
+            current_device = None
+    if current_device is None:
+        current_device = _normalize_device(loaded_device)
+    if current_device is None or current_device.type == "cpu":
+        return False
+
+    return _devices_match(offload_device, current_device)
+
+
+@contextlib.contextmanager
+def _temporary_offload_device(model: Any, target_device: torch.device | None):
+    if model is None or target_device is None or not hasattr(model, "offload_device"):
+        yield False
+        return
+
+    original_device = getattr(model, "offload_device", None)
+    if _devices_match(original_device, target_device):
+        yield False
+        return
+
+    setattr(model, "offload_device", target_device)
+    try:
+        yield True
+    finally:
+        setattr(model, "offload_device", original_device)
 
 
 def _safe_open_device_arg(device: torch.device) -> Any:
@@ -578,6 +624,44 @@ def _wrap_load_models_gpu(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _wrap_loaded_model_unload(func: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(func)
+    def wrapper(self, memory_to_free=None, unpatch_weights=True):
+        model = getattr(self, "model", None)
+        loaded_device = getattr(self, "device", None)
+        if not _cpu_offload_required(model, loaded_device):
+            return func(self, memory_to_free=memory_to_free, unpatch_weights=unpatch_weights)
+
+        with _temporary_offload_device(model, torch.device("cpu")) as redirected:
+            if redirected:
+                _LOG.debug(
+                    "GPU Resident Loader: redirecting unload of %s from %s to CPU to reclaim VRAM",
+                    type(getattr(model, "model", model)).__name__,
+                    _device_string(_normalize_device(loaded_device)),
+                )
+            return func(self, memory_to_free=memory_to_free, unpatch_weights=unpatch_weights)
+
+    return wrapper
+
+
+def _wrap_model_patcher_detach(func: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(func)
+    def wrapper(self, unpatch_all=True):
+        if not _cpu_offload_required(self, getattr(self.model, "device", None)):
+            return func(self, unpatch_all=unpatch_all)
+
+        with _temporary_offload_device(self, torch.device("cpu")) as redirected:
+            if redirected:
+                _LOG.debug(
+                    "GPU Resident Loader: redirecting detach of %s from %s to CPU to reclaim VRAM",
+                    type(getattr(self, "model", self)).__name__,
+                    _device_string(_normalize_device(getattr(self.model, "device", None))),
+                )
+            return func(self, unpatch_all=unpatch_all)
+
+    return wrapper
+
+
 def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(memory_required, device, keep_loaded=None, *args, **kwargs):
@@ -674,6 +758,10 @@ def _patch_model_management_devices() -> None:
     if model_management.load_models_gpu is original_load_models_gpu:
         model_management.load_models_gpu = _wrap_load_models_gpu(original_load_models_gpu)
 
+    original_model_unload = _remember_original("model_management.LoadedModel.model_unload", model_management.LoadedModel.model_unload)
+    if model_management.LoadedModel.model_unload is original_model_unload:
+        model_management.LoadedModel.model_unload = _wrap_loaded_model_unload(original_model_unload)
+
 
 def install_patches() -> None:
     global _PATCHED
@@ -684,6 +772,7 @@ def install_patches() -> None:
     import comfy.controlnet as controlnet
     import comfy.diffusers_load as diffusers_load
     import comfy.model_management as model_management
+    import comfy.model_patcher as model_patcher
     import comfy.sd as comfy_sd
     import comfy.utils as comfy_utils
 
@@ -696,6 +785,10 @@ def install_patches() -> None:
             clip_vision.load_torch_file = comfy_utils.load_torch_file
 
     _patch_model_management_devices()
+
+    original_model_patcher_detach = _remember_original("model_patcher.ModelPatcher.detach", model_patcher.ModelPatcher.detach)
+    if model_patcher.ModelPatcher.detach is original_model_patcher_detach:
+        model_patcher.ModelPatcher.detach = _wrap_model_patcher_detach(original_model_patcher_detach)
 
     original_load_checkpoint_guess_config = _remember_original(
         "sd.load_checkpoint_guess_config",
