@@ -661,6 +661,67 @@ def _sticky_safe_batch_number(*, batch_count: int, free_memory: int, memory_used
     return max(1, capped)
 
 
+def _scaled_batch_memory(total_memory_used: int, total_batch_count: int, batch_number: int) -> int:
+    total_memory = max(1, int(total_memory_used))
+    total_batches = max(1, int(total_batch_count))
+    current_batch = max(1, min(int(batch_number), total_batches))
+    return max(1, (total_memory * current_batch + total_batches - 1) // total_batches)
+
+
+def _prepare_sticky_vae_batch(
+    *,
+    device: Any,
+    patcher: Any,
+    total_memory_used: int,
+    total_batch_count: int,
+) -> tuple[int, bool]:
+    free_memory = int(patcher.get_free_memory(device))
+    batch_number = _sticky_safe_batch_number(
+        batch_count=total_batch_count,
+        free_memory=free_memory,
+        memory_used=total_memory_used,
+        device=device,
+    )
+    batch_memory_used = _scaled_batch_memory(total_memory_used, total_batch_count, batch_number)
+
+    if REGISTRY.get_policy() != "sticky_gpu" or device is None:
+        return batch_number, False
+
+    target_free = _sticky_protection_target(batch_memory_used, device)
+    if free_memory < target_free:
+        try:
+            trim_resident_vram(
+                device=device,
+                target_free_vram_bytes=target_free,
+                respect_sticky=True,
+                sticky_floor_priority=0,
+                allow_partial_unload=True,
+                keep_models=(patcher,),
+            )
+        except Exception as exc:
+            _LOG.debug("GPU Resident Loader: proactive VAE trim failed for %s bytes: %s", batch_memory_used, exc)
+
+        free_memory = int(patcher.get_free_memory(device))
+        batch_number = _sticky_safe_batch_number(
+            batch_count=total_batch_count,
+            free_memory=free_memory,
+            memory_used=total_memory_used,
+            device=device,
+        )
+        batch_memory_used = _scaled_batch_memory(total_memory_used, total_batch_count, batch_number)
+        target_free = _sticky_protection_target(batch_memory_used, device)
+
+    should_tile = free_memory < target_free and batch_number <= 1
+    if should_tile:
+        _LOG.info(
+            "GPU Resident Loader: skipping regular VAE pass and switching directly to tiled mode; free=%s target=%s batch_memory=%s",
+            free_memory,
+            target_free,
+            batch_memory_used,
+        )
+    return batch_number, should_tile
+
+
 def _wrap_vae_encode(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(self, pixel_samples):
@@ -681,29 +742,31 @@ def _wrap_vae_encode(func: Callable[..., Any]) -> Callable[..., Any]:
         try:
             memory_used = self.memory_used_encode(pixel_samples.shape, self.vae_dtype)
             model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
-            free_memory = self.patcher.get_free_memory(self.device)
-            batch_number = _sticky_safe_batch_number(
-                batch_count=pixel_samples.shape[0],
-                free_memory=free_memory,
-                memory_used=memory_used,
+            batch_number, should_tile = _prepare_sticky_vae_batch(
                 device=self.device,
+                patcher=self.patcher,
+                total_memory_used=memory_used,
+                total_batch_count=pixel_samples.shape[0],
             )
-            samples = None
-            for x in range(0, pixel_samples.shape[0], batch_number):
-                pixels_in = self.process_input(pixel_samples[x:x + batch_number]).to(self.vae_dtype)
-                if getattr(self.first_stage_model, "comfy_has_chunked_io", False):
-                    out = self.first_stage_model.encode(pixels_in, device=self.device)
-                else:
-                    pixels_in = pixels_in.to(self.device)
-                    out = self.first_stage_model.encode(pixels_in)
-                out = out.to(self.output_device).to(dtype=self.vae_output_dtype())
-                if samples is None:
-                    samples = torch.empty(
-                        (pixel_samples.shape[0],) + tuple(out.shape[1:]),
-                        device=self.output_device,
-                        dtype=self.vae_output_dtype(),
-                    )
-                samples[x:x + batch_number] = out
+            if should_tile:
+                do_tile = True
+            else:
+                samples = None
+                for x in range(0, pixel_samples.shape[0], batch_number):
+                    pixels_in = self.process_input(pixel_samples[x:x + batch_number]).to(self.vae_dtype)
+                    if getattr(self.first_stage_model, "comfy_has_chunked_io", False):
+                        out = self.first_stage_model.encode(pixels_in, device=self.device)
+                    else:
+                        pixels_in = pixels_in.to(self.device)
+                        out = self.first_stage_model.encode(pixels_in)
+                    out = out.to(self.output_device).to(dtype=self.vae_output_dtype())
+                    if samples is None:
+                        samples = torch.empty(
+                            (pixel_samples.shape[0],) + tuple(out.shape[1:]),
+                            device=self.output_device,
+                            dtype=self.vae_output_dtype(),
+                        )
+                    samples[x:x + batch_number] = out
         except Exception as e:
             model_management.raise_non_oom(e)
             _LOG.warning("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")
@@ -741,16 +804,15 @@ def _wrap_vae_decode(func: Callable[..., Any]) -> Callable[..., Any]:
         try:
             memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
             model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
-            free_memory = self.patcher.get_free_memory(self.device)
-            batch_number = _sticky_safe_batch_number(
-                batch_count=samples_in.shape[0],
-                free_memory=free_memory,
-                memory_used=memory_used,
+            batch_number, should_tile = _prepare_sticky_vae_batch(
                 device=self.device,
+                patcher=self.patcher,
+                total_memory_used=memory_used,
+                total_batch_count=samples_in.shape[0],
             )
 
             preallocated = False
-            if getattr(self.first_stage_model, "comfy_has_chunked_io", False):
+            if not should_tile and getattr(self.first_stage_model, "comfy_has_chunked_io", False):
                 pixel_samples = torch.empty(
                     self.first_stage_model.decode_output_shape(samples_in.shape),
                     device=self.output_device,
@@ -758,25 +820,28 @@ def _wrap_vae_decode(func: Callable[..., Any]) -> Callable[..., Any]:
                 )
                 preallocated = True
 
-            for x in range(0, samples_in.shape[0], batch_number):
-                samples = samples_in[x:x + batch_number].to(device=self.device, dtype=self.vae_dtype)
-                if preallocated:
-                    self.first_stage_model.decode(samples, output_buffer=pixel_samples[x:x + batch_number], **vae_options)
-                else:
-                    out = self.first_stage_model.decode(samples, **vae_options).to(
-                        device=self.output_device,
-                        dtype=self.vae_output_dtype(),
-                        copy=True,
-                    )
-                    if pixel_samples is None:
-                        pixel_samples = torch.empty(
-                            (samples_in.shape[0],) + tuple(out.shape[1:]),
+            if should_tile:
+                do_tile = True
+            else:
+                for x in range(0, samples_in.shape[0], batch_number):
+                    samples = samples_in[x:x + batch_number].to(device=self.device, dtype=self.vae_dtype)
+                    if preallocated:
+                        self.first_stage_model.decode(samples, output_buffer=pixel_samples[x:x + batch_number], **vae_options)
+                    else:
+                        out = self.first_stage_model.decode(samples, **vae_options).to(
                             device=self.output_device,
                             dtype=self.vae_output_dtype(),
+                            copy=True,
                         )
-                    pixel_samples[x:x + batch_number].copy_(out)
-                    del out
-                self.process_output(pixel_samples[x:x + batch_number])
+                        if pixel_samples is None:
+                            pixel_samples = torch.empty(
+                                (samples_in.shape[0],) + tuple(out.shape[1:]),
+                                device=self.output_device,
+                                dtype=self.vae_output_dtype(),
+                            )
+                        pixel_samples[x:x + batch_number].copy_(out)
+                        del out
+                    self.process_output(pixel_samples[x:x + batch_number])
         except Exception as e:
             model_management.raise_non_oom(e)
             _LOG.warning("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
