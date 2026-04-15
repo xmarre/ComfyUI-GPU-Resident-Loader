@@ -525,7 +525,6 @@ class ResidencyRegistry:
                 entry.loaded_bytes = int(loaded.model_loaded_memory())
                 entry.total_bytes = int(loaded.model_memory())
                 entry.current_device = str(loaded.device)
-                entry.last_touched = _now()
 
     def snapshot(self) -> list[dict[str, Any]]:
         self.refresh_runtime_state()

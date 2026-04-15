@@ -14,6 +14,8 @@ from safetensors import safe_open
 from .cleanup import (
     _device_matches as _shared_device_matches,
     _should_force_cpu_offload,
+    adaptive_headroom_bytes,
+    trim_resident_vram,
     unload_loaded_model,
 )
 from .residency import (
@@ -34,6 +36,8 @@ _METADATA_CPU_KEY_SUFFIXES = ("spiece_model", "tekken_model", "comfy_quant")
 _UNET_PREFIX_CANDIDATES = ("model.diffusion_model.", "model.model.", "net.")
 _WARNED_PICKLE_GPU_PATHS: set[str] = set()
 _SAFE_TENSORS_COMPONENT_CACHE_MAX = 32
+_STICKY_PROTECTION_VRAM_FLOOR_RATIO = 0.125
+_STICKY_PROTECTION_VRAM_FLOOR_CEIL_BYTES = 16 * 1024 ** 3
 _SAFETENSORS_DTYPE_MAP = {
     "BOOL": torch.bool,
     "U8": torch.uint8,
@@ -402,6 +406,37 @@ def _warn_pickle_gpu_compatibility(path: str, requested_device: torch.device) ->
     )
 
 
+def _sticky_protection_target(memory_required: int, device: Any) -> int:
+    import comfy.model_management as model_management
+
+    required = max(0, int(memory_required))
+    target = required + adaptive_headroom_bytes(required)
+
+    minimum_inference_memory = getattr(model_management, "minimum_inference_memory", None)
+    if callable(minimum_inference_memory):
+        try:
+            target = max(target, int(minimum_inference_memory()))
+        except Exception:
+            pass
+
+    get_total_memory = getattr(model_management, "get_total_memory", None)
+    if callable(get_total_memory):
+        try:
+            total_memory = int(get_total_memory(device))
+        except Exception:
+            total_memory = 0
+        if total_memory > 0:
+            target = max(
+                target,
+                min(
+                    _STICKY_PROTECTION_VRAM_FLOOR_CEIL_BYTES,
+                    int(total_memory * _STICKY_PROTECTION_VRAM_FLOOR_RATIO),
+                ),
+            )
+
+    return target
+
+
 def _resolved_context(kind: str, source_path: str | None) -> tuple[torch.device | None, str, str | None]:
     ctx = REGISTRY.current_context()
     if ctx is not None and ctx.explicit_device is not None:
@@ -718,12 +753,30 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
         import comfy.model_management as model_management
 
         keep_loaded = list(keep_loaded or [])
-        sticky_wrappers = []
-        if REGISTRY.get_policy() == "sticky_gpu":
-            sticky_wrappers = [w for w in REGISTRY.sticky_loaded_wrappers(device) if w not in keep_loaded]
-
         protected_wrappers: list[Any] = []
+        sticky_wrappers: list[Any] = []
+        if REGISTRY.get_policy() == "sticky_gpu" and device is not None:
+            sticky_wrappers = [w for w in REGISTRY.sticky_loaded_wrappers(device) if w not in keep_loaded]
         if device is not None and sticky_wrappers:
+            protection_target = _sticky_protection_target(memory_required, device)
+            keep_models = tuple(
+                model
+                for model in (getattr(loaded_wrapper, "model", None) for loaded_wrapper in keep_loaded)
+                if model is not None
+            )
+            try:
+                trim_resident_vram(
+                    device=device,
+                    target_free_vram_bytes=protection_target,
+                    respect_sticky=True,
+                    sticky_floor_priority=0,
+                    allow_partial_unload=True,
+                    keep_models=keep_models,
+                )
+            except Exception as exc:
+                _LOG.debug("GPU Resident Loader: sticky pre-trim failed for free_memory(%s): %s", memory_required, exc)
+
+            sticky_wrappers = [w for w in REGISTRY.sticky_loaded_wrappers(device) if w not in keep_loaded]
             try:
                 free_now = model_management.get_free_memory(device)
             except Exception:
@@ -737,7 +790,7 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
                         unloadable_wrappers.append(loaded)
                 available_for_protection = max(
                     0,
-                    free_now + sum(max(0, loaded.model_loaded_memory()) for loaded in unloadable_wrappers) - memory_required,
+                    free_now + sum(max(0, loaded.model_loaded_memory()) for loaded in unloadable_wrappers) - protection_target,
                 )
                 protected_memory = 0
                 for loaded in sticky_wrappers:
