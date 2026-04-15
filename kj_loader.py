@@ -419,6 +419,7 @@ def _maybe_trim_before_load(
     report = trim_resident_vram_for_load(
         required_bytes=required_bytes,
         reason=reason,
+        device=explicit_device,
         keep_models=keep_models,
     )
     if report["freed_vram_bytes"] > 0:

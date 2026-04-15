@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 import comfy.model_management as model_management
+import torch
 
 from .residency import REGISTRY
 
@@ -14,6 +15,15 @@ _ADAPTIVE_HEADROOM_CEIL_BYTES = 1024 * 1024 * 1024
 
 def _safe_free_memory(device) -> int:
     return int(model_management.get_free_memory(device))
+
+
+def _normalize_trim_device(device: str | torch.device | None):
+    if device is None or isinstance(device, torch.device):
+        return device
+    try:
+        return torch.device(device)
+    except Exception:
+        return device
 
 
 def _safe_is_dead(loaded) -> bool:
@@ -84,6 +94,7 @@ def _trim_candidates(
 
 def trim_resident_vram(
     *,
+    device: str | torch.device | None = None,
     target_free_vram_bytes: int,
     respect_sticky: bool,
     sticky_floor_priority: int,
@@ -95,7 +106,9 @@ def trim_resident_vram(
         cleanup_models_gc()
 
     REGISTRY.refresh_runtime_state()
-    device = model_management.get_torch_device()
+    device = _normalize_trim_device(device)
+    if device is None:
+        device = model_management.get_torch_device()
     free_before = _safe_free_memory(device)
     actions: list[dict[str, Any]] = []
     soft_empty_cache = getattr(model_management, "soft_empty_cache", None)
@@ -218,6 +231,7 @@ def trim_resident_vram_for_load(
     *,
     required_bytes: int,
     reason: str,
+    device: str | torch.device | None = None,
     respect_sticky: bool = True,
     sticky_floor_priority: int = 0,
     allow_partial_unload: bool = True,
@@ -228,6 +242,7 @@ def trim_resident_vram_for_load(
     target_free_vram_bytes = estimated_load_bytes + headroom_bytes
 
     report = trim_resident_vram(
+        device=device,
         target_free_vram_bytes=target_free_vram_bytes,
         respect_sticky=respect_sticky,
         sticky_floor_priority=sticky_floor_priority,
