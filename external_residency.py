@@ -496,6 +496,7 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
         _SEEDVR2_PATCHING_CLASS_IDS.add(class_id)
         _SEEDVR2_PATCHING_THREAD_IDS[class_id] = thread_id
 
+    try:
         original_set_dit = model_cache_cls.set_dit
         original_set_vae = model_cache_cls.set_vae
         original_replace_dit = getattr(model_cache_cls, "replace_dit", None)
@@ -577,7 +578,6 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
             model_cache_cls.replace_vae = replace_vae_wrapper
         model_cache_cls.remove_dit = remove_dit_wrapper
         model_cache_cls.remove_vae = remove_vae_wrapper
-    try:
         global_cache = get_global_cache()
         model_cache_lock = getattr(global_cache, "_model_cache_lock", None)
         lock_context = model_cache_lock if model_cache_lock is not None else contextlib.nullcontext()
