@@ -11,6 +11,11 @@ from typing import Any, Callable
 import torch
 from safetensors import safe_open
 
+from .cleanup import (
+    _device_matches as _shared_device_matches,
+    _should_force_cpu_offload,
+    unload_loaded_model,
+)
 from .residency import (
     KIND_CHECKPOINT,
     KIND_CLIP,
@@ -221,18 +226,10 @@ def _device_string(device: torch.device | None) -> str:
 
 
 def _devices_match(device_a: Any | None, device_b: Any | None) -> bool:
-    normalized_a = _normalize_device(device_a)
-    normalized_b = _normalize_device(device_b)
-    if normalized_a is not None and normalized_b is not None:
-        return normalized_a == normalized_b
-    return device_a == device_b
+    return _shared_device_matches(device_a, device_b)
 
 
 def _cpu_offload_required(model: Any, loaded_device: Any | None) -> bool:
-    offload_device = _normalize_device(getattr(model, "offload_device", None))
-    if offload_device is None or offload_device.type == "cpu":
-        return False
-
     current_device = None
     if hasattr(model, "current_loaded_device"):
         try:
@@ -241,10 +238,7 @@ def _cpu_offload_required(model: Any, loaded_device: Any | None) -> bool:
             current_device = None
     if current_device is None:
         current_device = _normalize_device(loaded_device)
-    if current_device is None or current_device.type == "cpu":
-        return False
-
-    return _devices_match(offload_device, current_device)
+    return _should_force_cpu_offload(model, active_device=current_device)
 
 
 @contextlib.contextmanager
@@ -615,6 +609,62 @@ def _wrap_load_clip(func: Callable[..., Any]) -> Callable[..., Any]:
 def _wrap_load_models_gpu(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(models, *args, **kwargs):
+        import comfy.model_management as model_management
+
+        requested_models = set()
+        for model in list(models):
+            requested_models.add(model)
+            for additional in model.model_patches_models():
+                requested_models.add(additional)
+
+        clone_conflicts: list[Any] = []
+        seen_loaded_ids: set[int] = set()
+        for requested in requested_models:
+            is_clone = getattr(requested, "is_clone", None)
+            if not callable(is_clone):
+                continue
+            for loaded in list(model_management.current_loaded_models):
+                try:
+                    dead = loaded.is_dead()
+                except Exception:
+                    dead = False
+                if id(loaded) in seen_loaded_ids or dead:
+                    continue
+                loaded_model = getattr(loaded, "model", None)
+                if loaded_model is None or loaded_model is requested:
+                    continue
+                try:
+                    if not requested.is_clone(loaded_model):
+                        continue
+                except Exception as exc:
+                    raise RuntimeError(
+                        "GPU Resident Loader: failed to evaluate clone-conflict state before replacement"
+                    ) from exc
+                clone_conflicts.append(loaded)
+                seen_loaded_ids.add(id(loaded))
+
+        clone_conflicts_unloaded = 0
+        try:
+            for loaded in clone_conflicts:
+                # ComfyUI's built-in clone replacement pops the wrapper and only calls detach(False),
+                # which does not unpatch base weights. Fully unload before replacement or fail closed.
+                if not unload_loaded_model(
+                    loaded,
+                    active_device=getattr(loaded, "device", None),
+                    force_offload_to_cpu=True,
+                ):
+                    raise RuntimeError("GPU Resident Loader: failed to fully unload a clone-conflict wrapper before replacement")
+                try:
+                    model_management.current_loaded_models.remove(loaded)
+                except ValueError:
+                    pass
+                clone_conflicts_unloaded += 1
+        finally:
+            if clone_conflicts_unloaded > 0:
+                if hasattr(model_management, "soft_empty_cache"):
+                    model_management.soft_empty_cache()
+                REGISTRY.refresh_runtime_state()
+
         result = func(models, *args, **kwargs)
         for model in list(models):
             REGISTRY.touch(model)

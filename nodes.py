@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import comfy.model_management as model_management
 
+from .cleanup import unload_loaded_model
 from .kj_loader import (
     CheckpointClipLoaderResident,
     CheckpointLoaderResident,
@@ -14,6 +16,8 @@ from .kj_loader import (
     DiffusionModelSelectorResident,
 )
 from .residency import REGISTRY
+
+_LOG = logging.getLogger(__name__)
 
 
 def _entry_report_json(obj: Any) -> str:
@@ -59,9 +63,28 @@ def _evict_patcher(patcher, *, unpatch_weights: bool) -> bool:
         raise RuntimeError("Expected a patcher-capable object, but no patcher was found.")
     unloaded = False
     for loaded in list(model_management.current_loaded_models):
-        if loaded.model is patcher or loaded.model.is_clone(patcher):
-            loaded.model_unload(unpatch_weights=unpatch_weights)
-            unloaded = True
+        loaded_model = getattr(loaded, "model", None)
+        if loaded_model is None:
+            continue
+        safe_is_clone = False
+        if loaded_model is not patcher:
+            try:
+                safe_is_clone = loaded_model.is_clone(patcher)
+            except Exception as exc:
+                _LOG.warning("GPU Resident Loader: failed to evaluate clone state during eviction: %s", exc)
+        if loaded_model is patcher or safe_is_clone:
+            fully_unloaded = unload_loaded_model(
+                loaded,
+                active_device=getattr(loaded, "device", None),
+                force_offload_to_cpu=True,
+                unpatch_weights=unpatch_weights,
+            )
+            if fully_unloaded and unpatch_weights:
+                try:
+                    model_management.current_loaded_models.remove(loaded)
+                except ValueError:
+                    pass
+            unloaded = unloaded or fully_unloaded
     if unloaded and hasattr(model_management, "soft_empty_cache"):
         model_management.soft_empty_cache()
     REGISTRY.refresh_runtime_state()
