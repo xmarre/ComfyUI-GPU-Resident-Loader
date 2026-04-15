@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
+import struct
 from typing import Any, Callable
 
 import torch
@@ -25,6 +27,118 @@ _ORIGINALS: dict[str, Callable[..., Any]] = {}
 _METADATA_CPU_KEY_SUFFIXES = ("spiece_model", "tekken_model", "comfy_quant")
 _UNET_PREFIX_CANDIDATES = ("model.diffusion_model.", "model.model.", "net.")
 _WARNED_PICKLE_GPU_PATHS: set[str] = set()
+_SAFE_TENSORS_COMPONENT_CACHE_MAX = 32
+_SAFETENSORS_DTYPE_MAP = {
+    "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "U16": getattr(torch, "uint16", torch.int32),
+    "I32": torch.int32,
+    "U32": getattr(torch, "uint32", torch.int64),
+    "I64": torch.int64,
+    "U64": getattr(torch, "uint64", torch.int64),
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "F8_E4M3FN": getattr(torch, "float8_e4m3fn", torch.float16),
+    "F8_E5M2": getattr(torch, "float8_e5m2", torch.float16),
+}
+
+
+def _safetensors_header_cache_key(path: str) -> tuple[str, int, int]:
+    stat = os.stat(path)
+    return (os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
+
+
+def _read_safetensors_header(path: str) -> tuple[dict[str, dict[str, Any]], dict[str, str] | None]:
+    with open(path, "rb") as handle:
+        header_size = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(header_size))
+
+    metadata = header.get("__metadata__")
+    tensor_headers = {
+        key: value
+        for key, value in header.items()
+        if key != "__metadata__" and isinstance(value, dict)
+    }
+    return tensor_headers, metadata if isinstance(metadata, dict) else None
+
+
+def _torch_dtype_from_safetensors_code(code: str | None) -> torch.dtype:
+    if code is None:
+        return torch.float32
+    return _SAFETENSORS_DTYPE_MAP.get(code, torch.float32)
+
+
+def _build_meta_state_dict_from_header(tensor_headers: dict[str, dict[str, Any]]) -> dict[str, torch.Tensor]:
+    meta_state_dict: dict[str, torch.Tensor] = {}
+    for key, tensor_info in tensor_headers.items():
+        shape = tuple(int(dim) for dim in tensor_info.get("shape", ()))
+        meta_state_dict[key] = torch.empty(
+            shape,
+            dtype=_torch_dtype_from_safetensors_code(tensor_info.get("dtype")),
+            device="meta",
+        )
+    return meta_state_dict
+
+
+@functools.lru_cache(maxsize=_SAFE_TENSORS_COMPONENT_CACHE_MAX)
+def _cached_component_key_maps(cache_key: tuple[str, int, int]) -> dict[str, Any]:
+    import comfy.sd as comfy_sd
+
+    path = cache_key[0]
+    tensor_headers, metadata = _read_safetensors_header(path)
+    all_keys = tuple(tensor_headers)
+    unet_prefix = infer_unet_prefix_from_keys(all_keys)
+    meta_state_dict = _build_meta_state_dict_from_header(tensor_headers)
+    model_config = comfy_sd.model_detection.model_config_from_unet(meta_state_dict, unet_prefix, metadata=metadata)
+
+    def select_prefixed(prefixes: tuple[str, ...] | list[str] | None) -> tuple[tuple[str, str], ...]:
+        if not prefixes:
+            return ()
+        return tuple(
+            (key, key)
+            for key in all_keys
+            if any(key.startswith(prefix) for prefix in prefixes)
+        )
+
+    return {
+        "metadata": metadata,
+        "unet_prefix": unet_prefix,
+        "model_config": model_config,
+        "model": tuple((key, key[len(unet_prefix):]) for key in all_keys if key.startswith(unet_prefix)),
+        "clip": select_prefixed(getattr(model_config, "text_encoder_key_prefix", None) or ()),
+        "vae": select_prefixed(getattr(model_config, "vae_key_prefix", None) or ()),
+    }
+
+
+def checkpoint_component_info_from_header(path: str) -> dict[str, Any] | None:
+    try:
+        return _cached_component_key_maps(_safetensors_header_cache_key(path))
+    except Exception as exc:
+        _LOG.warning("GPU Resident Loader: failed to build selective safetensors header map for %s: %s", path, exc)
+        return None
+
+
+def _selected_component_keys_from_header(path: str, kind: str) -> dict[str, str] | None:
+    if kind not in {KIND_MODEL, KIND_CLIP, KIND_VAE}:
+        return None
+    component_maps = checkpoint_component_info_from_header(path)
+    if component_maps is None:
+        return None
+
+    pairs = component_maps.get(kind, ())
+    return dict(pairs) if pairs else None
+
+
+def _selected_component_suffix(kind: str | None) -> str | None:
+    return {
+        KIND_MODEL: "model_only",
+        KIND_CLIP: "clip_only",
+        KIND_VAE: "vae_only",
+    }.get(kind)
 
 
 def _normalize_device(device: Any | None) -> torch.device | None:
@@ -233,12 +347,10 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
     if lowered.endswith((".safetensors", ".sft")):
         try:
             selected_keys = None
-            if ctx is not None and ctx.kind == KIND_MODEL:
-                with safe_open(ckpt, framework="pt", device="cpu") as handle:
-                    all_keys = list(handle.keys())
-                prefix = infer_unet_prefix_from_keys(all_keys)
-                candidate_keys = {key: key[len(prefix):] for key in all_keys if key.startswith(prefix)}
-                selected_keys = candidate_keys or None
+            selected_suffix = None
+            if ctx is not None and ctx.kind in {KIND_MODEL, KIND_CLIP, KIND_VAE}:
+                selected_keys = _selected_component_keys_from_header(ckpt, ctx.kind)
+                selected_suffix = _selected_component_suffix(ctx.kind)
 
             sd, metadata, actual_device, load_mode = load_safetensors_state_dict(
                 ckpt,
@@ -248,9 +360,9 @@ def _patched_load_torch_file(ckpt, safe_load=False, device=None, return_metadata
             )
             if load_mode == "aimdo_cpu":
                 method = "safetensors_aimdo_cpu"
-            elif selected_keys is not None:
-                method = "safetensors_cpu_then_copy_to_cuda_model_only" if load_mode == "cpu_then_copy" else (
-                    "safetensors_gpu_direct_model_only" if requested_device.type == "cuda" else "safetensors_cpu_model_only"
+            elif selected_keys is not None and selected_suffix is not None:
+                method = f"safetensors_cpu_then_copy_to_cuda_{selected_suffix}" if load_mode == "cpu_then_copy" else (
+                    f"safetensors_gpu_direct_{selected_suffix}" if requested_device.type == "cuda" else f"safetensors_cpu_{selected_suffix}"
                 )
             else:
                 method = "safetensors_cpu_then_copy_to_cuda" if load_mode == "cpu_then_copy" else (
