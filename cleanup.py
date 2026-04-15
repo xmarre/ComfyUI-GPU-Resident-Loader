@@ -7,6 +7,7 @@ from typing import Any
 import comfy.model_management as model_management
 import torch
 
+from .external_residency import EXTERNAL_REGISTRY, ensure_external_integrations_installed
 from .residency import REGISTRY
 
 _ADAPTIVE_HEADROOM_RATIO = 0.125
@@ -129,8 +130,9 @@ def _trim_candidates(
     respect_sticky: bool,
     sticky_floor_priority: int,
     keep_models: tuple[Any, ...],
-) -> list[tuple[Any, Any, bool]]:
-    candidates: list[tuple[Any, Any, bool]] = []
+) -> list[tuple[Any, Any, bool, bool]]:
+    candidates: list[tuple[Any, Any, bool, bool]] = []
+    ensure_external_integrations_installed()
     for loaded in list(model_management.current_loaded_models):
         if device is not None and loaded.device != device:
             continue
@@ -150,7 +152,15 @@ def _trim_candidates(
             and bool(getattr(entry, "sticky", False))
             and int(getattr(entry, "priority", 0)) >= int(sticky_floor_priority)
         )
-        candidates.append((loaded, entry, sticky_respected))
+        candidates.append((loaded, entry, sticky_respected, False))
+
+    for external_obj, entry, sticky_respected in EXTERNAL_REGISTRY.candidates(
+        device=device,
+        respect_sticky=respect_sticky,
+        sticky_floor_priority=sticky_floor_priority,
+        keep_models=keep_models,
+    ):
+        candidates.append((external_obj, entry, sticky_respected, True))
 
     candidates.sort(key=lambda item: _sort_key_for_candidate(item[1], sticky_respected=item[2]))
     return candidates
@@ -165,11 +175,13 @@ def trim_resident_vram(
     allow_partial_unload: bool,
     keep_models: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
+    ensure_external_integrations_installed()
     cleanup_models_gc = getattr(model_management, "cleanup_models_gc", None)
     if callable(cleanup_models_gc):
         cleanup_models_gc()
 
     REGISTRY.refresh_runtime_state()
+    EXTERNAL_REGISTRY.refresh_runtime_state()
     device = _normalize_trim_device(device)
     if device is None:
         device = model_management.get_torch_device()
@@ -195,13 +207,14 @@ def trim_resident_vram(
             stopped_reason = "no_candidates"
             break
 
-        loaded, entry, sticky_respected = candidates[0]
-        model = loaded.model
-        loaded_before = int(loaded.model_loaded_memory())
+        candidate, entry, sticky_respected, is_external_candidate = candidates[0]
+        model = candidate if is_external_candidate else candidate.model
+        loaded_before = int(getattr(entry, "loaded_bytes", 0)) if is_external_candidate else int(candidate.model_loaded_memory())
         action = {
             "entry_id": getattr(entry, "entry_id", None),
             "basename": None if entry is None else os.path.basename(getattr(entry, "source_path", "") or ""),
             "tracked": entry is not None,
+            "external_candidate": bool(is_external_candidate),
             "sticky_respected": sticky_respected,
             "priority": None if entry is None else int(getattr(entry, "priority", 0)),
             "need_before_bytes": need,
@@ -209,7 +222,7 @@ def trim_resident_vram(
             "freed_pinned_ram_bytes": 0,
         }
 
-        if allow_partial_unload and hasattr(model, "pinned_memory_size") and hasattr(model, "partially_unload_ram"):
+        if (not is_external_candidate and allow_partial_unload and hasattr(model, "pinned_memory_size") and hasattr(model, "partially_unload_ram")):
             try:
                 pinned_memory = int(model.pinned_memory_size())
                 if pinned_memory > 0:
@@ -219,31 +232,42 @@ def trim_resident_vram(
             except Exception as exc:
                 action["pinned_ram_warning"] = str(exc)
 
-        try:
-            fully_unloaded = loaded.model_unload(need if allow_partial_unload else None)
-            action["mode"] = "full_unload" if fully_unloaded else "partial_unload"
-        except Exception as exc:
-            if allow_partial_unload:
-                try:
-                    fully_unloaded = loaded.model_unload(None)
-                    action["mode"] = "full_unload_fallback"
-                    action["partial_unload_warning"] = str(exc)
-                except Exception as fallback_exc:
-                    action["mode"] = "error"
-                    action["error"] = str(fallback_exc)
-                    actions.append(action)
-                    stopped_reason = "error"
-                    break
-            else:
+        if is_external_candidate:
+            try:
+                fully_unloaded = EXTERNAL_REGISTRY.evict(entry)
+                action["mode"] = "external_evict"
+            except Exception as exc:
                 action["mode"] = "error"
                 action["error"] = str(exc)
                 actions.append(action)
                 stopped_reason = "error"
                 break
-
-        if fully_unloaded:
+        else:
             try:
-                model_management.current_loaded_models.remove(loaded)
+                fully_unloaded = candidate.model_unload(need if allow_partial_unload else None)
+                action["mode"] = "full_unload" if fully_unloaded else "partial_unload"
+            except Exception as exc:
+                if allow_partial_unload:
+                    try:
+                        fully_unloaded = candidate.model_unload(None)
+                        action["mode"] = "full_unload_fallback"
+                        action["partial_unload_warning"] = str(exc)
+                    except Exception as fallback_exc:
+                        action["mode"] = "error"
+                        action["error"] = str(fallback_exc)
+                        actions.append(action)
+                        stopped_reason = "error"
+                        break
+                else:
+                    action["mode"] = "error"
+                    action["error"] = str(exc)
+                    actions.append(action)
+                    stopped_reason = "error"
+                    break
+
+        if fully_unloaded and not is_external_candidate:
+            try:
+                model_management.current_loaded_models.remove(candidate)
             except ValueError:
                 pass
 
@@ -251,8 +275,12 @@ def trim_resident_vram(
             soft_empty_cache()
 
         REGISTRY.refresh_runtime_state()
+        EXTERNAL_REGISTRY.refresh_runtime_state()
         free_after = _safe_free_memory(device)
-        action["loaded_after_bytes"] = 0 if fully_unloaded else int(loaded.model_loaded_memory())
+        if is_external_candidate:
+            action["loaded_after_bytes"] = 0 if fully_unloaded else int(getattr(entry, "loaded_bytes", 0))
+        else:
+            action["loaded_after_bytes"] = 0 if fully_unloaded else int(candidate.model_loaded_memory())
         action["freed_vram_bytes"] = max(0, free_after - free_now)
         action["free_after_bytes"] = free_after
         actions.append(action)

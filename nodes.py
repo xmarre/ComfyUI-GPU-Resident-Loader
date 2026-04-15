@@ -7,6 +7,7 @@ from typing import Any
 import comfy.model_management as model_management
 
 from .cleanup import unload_loaded_model
+from .external_residency import EXTERNAL_REGISTRY, ensure_external_integrations_installed
 from .kj_loader import (
     CheckpointClipLoaderResident,
     CheckpointLoaderResident,
@@ -123,7 +124,13 @@ class RegistrySnapshot:
     CATEGORY = "GPU Resident Loader/residency"
 
     def snapshot(self):
-        return (REGISTRY.snapshot_json(),)
+        ensure_external_integrations_installed()
+        payload = {
+            "policy": REGISTRY.get_policy(),
+            "entries": REGISTRY.snapshot(),
+            "external_entries": EXTERNAL_REGISTRY.snapshot(),
+        }
+        return (json.dumps(payload, indent=2, sort_keys=True),)
 
 
 class PinModelResidency:
