@@ -18,7 +18,10 @@ from .residency import KIND_MODEL, KIND_VAE, REGISTRY
 
 _LOG = logging.getLogger(__name__)
 _SEEDVR2_PATCHED_CLASS_IDS: set[int] = set()
+_SEEDVR2_PATCHING_CLASS_IDS: set[int] = set()
+_SEEDVR2_PATCHING_THREAD_IDS: dict[int, int] = {}
 _SEEDVR2_PATCH_LOCK = threading.Lock()
+_SEEDVR2_PATCH_CONDITION = threading.Condition(_SEEDVR2_PATCH_LOCK)
 
 
 def _now() -> float:
@@ -153,6 +156,20 @@ def _seedvr2_state_provider(
         }
 
     return provider
+
+
+def _coerce_external_bytes(value: Any, fallback: int, *, cache_key: str, field_name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        _LOG.debug(
+            "GPU Resident Loader: ignoring invalid external %s for %s: %r (%s)",
+            field_name,
+            cache_key,
+            value,
+            exc,
+        )
+        return int(fallback)
 
 
 @dataclasses.dataclass(slots=True)
@@ -301,8 +318,18 @@ class ExternalResidencyRegistry:
                 entry.load_device = state.get("load_device")
                 entry.offload_device = state.get("offload_device")
                 entry.claimed = bool(state.get("claimed", False))
-                entry.loaded_bytes = int(state.get("loaded_bytes", entry.loaded_bytes or 0))
-                entry.total_bytes = int(state.get("total_bytes", entry.total_bytes or entry.loaded_bytes or 0))
+                entry.loaded_bytes = _coerce_external_bytes(
+                    state.get("loaded_bytes", entry.loaded_bytes or 0),
+                    entry.loaded_bytes or 0,
+                    cache_key=cache_key,
+                    field_name="loaded_bytes",
+                )
+                entry.total_bytes = _coerce_external_bytes(
+                    state.get("total_bytes", entry.total_bytes or entry.loaded_bytes or 0),
+                    entry.total_bytes or entry.loaded_bytes or 0,
+                    cache_key=cache_key,
+                    field_name="total_bytes",
+                )
             for cache_key in stale_keys:
                 entry_id = self._cache_key_to_entry.pop(cache_key, None)
                 if entry_id is not None:
@@ -456,10 +483,18 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
     if model_cache_cls is None or not callable(get_global_cache):
         return False
 
-    patched_now = False
-    with _SEEDVR2_PATCH_LOCK:
-        if id(model_cache_cls) in _SEEDVR2_PATCHED_CLASS_IDS:
+    class_id = id(model_cache_cls)
+    thread_id = threading.get_ident()
+    with _SEEDVR2_PATCH_CONDITION:
+        while (
+            class_id in _SEEDVR2_PATCHING_CLASS_IDS
+            and _SEEDVR2_PATCHING_THREAD_IDS.get(class_id) != thread_id
+        ):
+            _SEEDVR2_PATCH_CONDITION.wait()
+        if class_id in _SEEDVR2_PATCHED_CLASS_IDS or _SEEDVR2_PATCHING_THREAD_IDS.get(class_id) == thread_id:
             return True
+        _SEEDVR2_PATCHING_CLASS_IDS.add(class_id)
+        _SEEDVR2_PATCHING_THREAD_IDS[class_id] = thread_id
 
         original_set_dit = model_cache_cls.set_dit
         original_set_vae = model_cache_cls.set_vae
@@ -542,12 +577,10 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
             model_cache_cls.replace_vae = replace_vae_wrapper
         model_cache_cls.remove_dit = remove_dit_wrapper
         model_cache_cls.remove_vae = remove_vae_wrapper
-        patched_now = True
-
-    global_cache = get_global_cache()
-    model_cache_lock = getattr(global_cache, "_model_cache_lock", None)
-    lock_context = model_cache_lock if model_cache_lock is not None else contextlib.nullcontext()
     try:
+        global_cache = get_global_cache()
+        model_cache_lock = getattr(global_cache, "_model_cache_lock", None)
+        lock_context = model_cache_lock if model_cache_lock is not None else contextlib.nullcontext()
         with lock_context:
             dit_items = list(getattr(global_cache, "_dit_models", {}).items())
             vae_items = list(getattr(global_cache, "_vae_models", {}).items())
@@ -564,21 +597,26 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
             if model is not None:
                 _register_seedvr2_cached_model(global_cache, kind="vae", config=config, model=model)
     except Exception:
-        if patched_now:
-            with _SEEDVR2_PATCH_LOCK:
-                model_cache_cls.set_dit = original_set_dit
-                model_cache_cls.set_vae = original_set_vae
-                if original_replace_dit is not None:
-                    model_cache_cls.replace_dit = original_replace_dit
-                if original_replace_vae is not None:
-                    model_cache_cls.replace_vae = original_replace_vae
-                model_cache_cls.remove_dit = original_remove_dit
-                model_cache_cls.remove_vae = original_remove_vae
-                _SEEDVR2_PATCHED_CLASS_IDS.discard(id(model_cache_cls))
+        with _SEEDVR2_PATCH_CONDITION:
+            model_cache_cls.set_dit = original_set_dit
+            model_cache_cls.set_vae = original_set_vae
+            if original_replace_dit is not None:
+                model_cache_cls.replace_dit = original_replace_dit
+            if original_replace_vae is not None:
+                model_cache_cls.replace_vae = original_replace_vae
+            model_cache_cls.remove_dit = original_remove_dit
+            model_cache_cls.remove_vae = original_remove_vae
+            _SEEDVR2_PATCHING_CLASS_IDS.discard(class_id)
+            _SEEDVR2_PATCHED_CLASS_IDS.discard(class_id)
+            _SEEDVR2_PATCHING_THREAD_IDS.pop(class_id, None)
+            _SEEDVR2_PATCH_CONDITION.notify_all()
         raise
 
-    with _SEEDVR2_PATCH_LOCK:
-        _SEEDVR2_PATCHED_CLASS_IDS.add(id(model_cache_cls))
+    with _SEEDVR2_PATCH_CONDITION:
+        _SEEDVR2_PATCHING_CLASS_IDS.discard(class_id)
+        _SEEDVR2_PATCHED_CLASS_IDS.add(class_id)
+        _SEEDVR2_PATCHING_THREAD_IDS.pop(class_id, None)
+        _SEEDVR2_PATCH_CONDITION.notify_all()
     _LOG.info("GPU Resident Loader: integrated external SeedVR2 cache eviction hooks")
     return True
 
