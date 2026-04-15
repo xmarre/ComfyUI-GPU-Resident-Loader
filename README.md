@@ -62,6 +62,8 @@ Current patch surface:
 
 On `.safetensors`, the resident diffusion-model path now reads only the detected UNet keys and merges only matching keys from any extra state dict. Repeated resident loads also reuse a live equivalent object when the source path and loader-relevant options still match.
 
+Before a GPU-bound resident load needs fresh VRAM, the loader now estimates the upcoming footprint from the model or checkpoint file itself and trims only enough lower-priority residency to cover that request plus a small internal headroom margin. The existing sticky ordering and partial-unload preference stay intact. That decision lives in the loader path, not in a separate user-configured VRAM target node.
+
 ### Residency nodes
 
 - **Set Global Residency Policy**
