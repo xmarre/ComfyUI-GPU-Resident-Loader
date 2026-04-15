@@ -14,7 +14,7 @@ import comfy.utils
 from comfy.cli_args import PerformanceFeature, args
 from comfy.ldm.modules.attention import attention_pytorch, wrap_attn
 
-from .patches import infer_unet_prefix_from_keys, load_safetensors_state_dict
+from .patches import checkpoint_component_info_from_header, infer_unet_prefix_from_keys, load_safetensors_state_dict
 from .residency import KIND_CHECKPOINT, KIND_CLIP, KIND_MODEL, KIND_VAE, POLICIES, REGISTRY
 
 
@@ -576,17 +576,67 @@ def _load_checkpoint_clip_only(
         return reused_clip
 
     _warn_pickle_checkpoint_gpu_compatibility(loader_name, ckpt_path)
+    is_safetensors = _is_safetensors_path(ckpt_path)
+    header_info = checkpoint_component_info_from_header(ckpt_path) if is_safetensors else None
+    model_config = None if header_info is None else header_info.get("model_config")
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_CLIP, source_path=ckpt_path)
     with REGISTRY.load_context(kind=KIND_CLIP, source_path=ckpt_path, explicit_device=explicit_device, cache_key=loader_key):
-        sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
-    _, clip, _, _ = comfy.sd.load_state_dict_guess_config(
-        sd,
-        output_vae=False,
-        output_clip=True,
-        output_model=False,
-        embedding_directory=folder_paths.get_folder_paths("embeddings"),
-        metadata=metadata,
-    )
+        if is_safetensors and model_config is None:
+            requested_device = explicit_device if explicit_device is not None else torch.device("cpu")
+            sd, metadata, _, _ = load_safetensors_state_dict(
+                ckpt_path,
+                requested_device,
+                return_metadata=True,
+                selected_keys=None,
+            )
+        else:
+            sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
+    if model_config is None:
+        _, clip, _, _ = comfy.sd.load_state_dict_guess_config(
+            sd,
+            output_vae=False,
+            output_clip=True,
+            output_model=False,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            metadata=metadata,
+        )
+    else:
+        scaled_fp8_list = []
+        for key in list(sd.keys()):
+            if key.endswith(".scaled_fp8"):
+                scaled_fp8_list.append(key[:-len(".scaled_fp8")])
+
+        if scaled_fp8_list:
+            clip_source_sd: dict[str, Any] = {}
+            for key, value in sd.items():
+                if any(key.startswith(prefix) for prefix in scaled_fp8_list):
+                    continue
+                clip_source_sd[key] = value
+            for prefix in scaled_fp8_list:
+                quant_sd, _ = comfy.utils.convert_old_quants(sd, prefix, metadata=metadata or {})
+                clip_source_sd.update(quant_sd)
+        else:
+            clip_source_sd = sd
+
+        clip_target = model_config.clip_target(state_dict=clip_source_sd)
+        if clip_target is None:
+            clip = None
+        else:
+            clip_sd = model_config.process_clip_state_dict(clip_source_sd)
+            if len(clip_sd) == 0:
+                _LOG.warning("%s: no CLIP/text encoder weights found in %s after selective checkpoint load", loader_name, ckpt_path)
+                clip = None
+            else:
+                parameters = comfy.utils.calculate_parameters(clip_sd)
+                clip = comfy.sd.CLIP(
+                    clip_target,
+                    embedding_directory=folder_paths.get_folder_paths("embeddings"),
+                    tokenizer_data=clip_sd,
+                    parameters=parameters,
+                    state_dict=clip_sd,
+                    model_options={},
+                    disable_dynamic=False,
+                )
     _bind_clip_for_reuse(clip, source_path=ckpt_path, note="checkpoint clip", loader_key=loader_key)
     return clip
 
@@ -604,17 +654,42 @@ def _load_checkpoint_vae_only(
         return reused_vae
 
     _warn_pickle_checkpoint_gpu_compatibility(loader_name, ckpt_path)
+    is_safetensors = _is_safetensors_path(ckpt_path)
+    header_info = checkpoint_component_info_from_header(ckpt_path) if is_safetensors else None
+    model_config = None if header_info is None else header_info.get("model_config")
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_VAE, source_path=ckpt_path)
     with REGISTRY.load_context(kind=KIND_VAE, source_path=ckpt_path, explicit_device=explicit_device, cache_key=loader_key):
-        sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
-    _, _, vae, _ = comfy.sd.load_state_dict_guess_config(
-        sd,
-        output_vae=True,
-        output_clip=False,
-        output_model=False,
-        embedding_directory=folder_paths.get_folder_paths("embeddings"),
-        metadata=metadata,
-    )
+        if is_safetensors and model_config is None:
+            requested_device = explicit_device if explicit_device is not None else torch.device("cpu")
+            sd, metadata, _, _ = load_safetensors_state_dict(
+                ckpt_path,
+                requested_device,
+                return_metadata=True,
+                selected_keys=None,
+            )
+        else:
+            sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
+    if model_config is None:
+        _, _, vae, _ = comfy.sd.load_state_dict_guess_config(
+            sd,
+            output_vae=True,
+            output_clip=False,
+            output_model=False,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            metadata=metadata,
+        )
+    else:
+        vae_sd = comfy.utils.state_dict_prefix_replace(
+            sd,
+            {prefix: "" for prefix in model_config.vae_key_prefix},
+            filter_keys=True,
+        )
+        vae_sd = model_config.process_vae_state_dict(vae_sd)
+        if len(vae_sd) == 0:
+            _LOG.warning("%s: no VAE weights found in %s after selective checkpoint load", loader_name, ckpt_path)
+            vae = None
+        else:
+            vae = comfy.sd.VAE(sd=vae_sd, metadata=metadata)
     _bind_vae_for_reuse(vae, source_path=ckpt_path, note="checkpoint vae", loader_key=loader_key)
     return vae
 
@@ -649,70 +724,31 @@ def _load_full_checkpoint(
         _LOG.info("%s: reusing live checkpoint outputs for %s", loader_name, ckpt_path)
         return model, clip, vae
 
-    if len(missing) == 1:
-        if missing[0] == "model":
-            model = _load_resident_diffusion_model(
-                loader_name=loader_name,
-                cache_scope="checkpoint_model",
-                source_path=ckpt_path,
-                note="checkpoint model",
-                weight_dtype=weight_dtype,
-                compute_dtype=compute_dtype,
-                patch_cublaslinear=patch_cublaslinear,
-                sage_attention=sage_attention,
-                enable_fp16_accumulation=enable_fp16_accumulation,
-                policy_override=policy_override,
-            )
-        elif missing[0] == "clip":
-            clip = _load_checkpoint_clip_only(
-                ckpt_path=ckpt_path,
-                policy_override=policy_override,
-                loader_name=loader_name,
-            )
-        else:
-            vae = _load_checkpoint_vae_only(
-                ckpt_path=ckpt_path,
-                policy_override=policy_override,
-                loader_name=loader_name,
-            )
-        return model, clip, vae
-
-    _warn_pickle_checkpoint_gpu_compatibility(loader_name, ckpt_path)
-    model_options = _build_model_options(weight_dtype)
-    explicit_device = REGISTRY.explicit_load_device(kind=KIND_CHECKPOINT, source_path=ckpt_path)
-    with _temporary_backend_flags(
-        cublas=patch_cublaslinear,
-        fp16_accumulation=enable_fp16_accumulation,
-    ):
-        with REGISTRY.load_context(
-            kind=KIND_CHECKPOINT,
+    if model is None:
+        model = _load_resident_diffusion_model(
+            loader_name=loader_name,
+            cache_scope="checkpoint_model",
             source_path=ckpt_path,
-            explicit_device=explicit_device,
-            cache_key=_make_loader_key(
-                loader_name,
-                component="full_checkpoint",
-                weight_dtype=weight_dtype,
-                compute_dtype=compute_dtype,
-                patch_cublaslinear=patch_cublaslinear,
-                sage_attention=sage_attention,
-                enable_fp16_accumulation=enable_fp16_accumulation,
-                policy=_effective_policy_name(policy_override),
-            ),
-        ):
-            sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
-        model, clip, vae, _ = comfy.sd.load_state_dict_guess_config(
-            sd,
-            output_vae=True,
-            output_clip=True,
-            embedding_directory=folder_paths.get_folder_paths("embeddings"),
-            metadata=metadata,
-            model_options=model_options,
+            note="checkpoint model",
+            weight_dtype=weight_dtype,
+            compute_dtype=compute_dtype,
+            patch_cublaslinear=patch_cublaslinear,
+            sage_attention=sage_attention,
+            enable_fp16_accumulation=enable_fp16_accumulation,
+            policy_override=policy_override,
         )
-        _apply_model_postload_options(model, compute_dtype=compute_dtype, sage_attention=sage_attention)
-
-    _bind_model_for_reuse(model, source_path=ckpt_path, note="checkpoint model", loader_key=model_key)
-    _bind_clip_for_reuse(clip, source_path=ckpt_path, note="checkpoint clip", loader_key=clip_key)
-    _bind_vae_for_reuse(vae, source_path=ckpt_path, note="checkpoint vae", loader_key=vae_key)
+    if clip is None:
+        clip = _load_checkpoint_clip_only(
+            ckpt_path=ckpt_path,
+            policy_override=policy_override,
+            loader_name=loader_name,
+        )
+    if vae is None:
+        vae = _load_checkpoint_vae_only(
+            ckpt_path=ckpt_path,
+            policy_override=policy_override,
+            loader_name=loader_name,
+        )
     return model, clip, vae
 
 
@@ -876,7 +912,7 @@ class CheckpointLoaderResident:
     CATEGORY = "GPU Resident Loader/loaders"
     DESCRIPTION = (
         "Checkpoint loader with the KJ DiffusionModelLoader-style tuning knobs plus GPU-resident ingest. "
-        "It reuses live checkpoint components when possible and only falls back to a full checkpoint load when multiple outputs are missing."
+        "It reuses live checkpoint components when possible and composes missing outputs from the model, CLIP, and VAE loaders instead of materializing a broad checkpoint state dict."
     )
 
     def load(
