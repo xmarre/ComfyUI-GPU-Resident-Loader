@@ -407,17 +407,34 @@ def _register_seedvr2_cached_model(global_cache: Any, *, kind: str, config: Any,
     try:
         model_ref = weakref.ref(model)
     except TypeError:
-        model_ref = lambda: None
+        def model_ref() -> Any | None:
+            return None
 
     source_path = _seedvr2_source_path(kind, node_id, config, model)
     cache_key = _seedvr2_entry_key(kind, node_id)
     registry_kind = KIND_MODEL if kind == "dit" else KIND_VAE
 
     if kind == "dit":
-        evict_callback = lambda: bool(global_cache.remove_dit({"node_id": node_id}, debug=None))
+        def evict_callback() -> bool:
+            return bool(
+                _call_seedvr2_method_with_optional_expected_model(
+                    global_cache.remove_dit,
+                    {"node_id": node_id},
+                    debug=None,
+                    expected_model=model_ref(),
+                )
+            )
         note = f"SeedVR2 cached DiT node {node_id}"
     else:
-        evict_callback = lambda: bool(global_cache.remove_vae({"node_id": node_id}, debug=None))
+        def evict_callback() -> bool:
+            return bool(
+                _call_seedvr2_method_with_optional_expected_model(
+                    global_cache.remove_vae,
+                    {"node_id": node_id},
+                    debug=None,
+                    expected_model=model_ref(),
+                )
+            )
         note = f"SeedVR2 cached VAE node {node_id}"
 
     EXTERNAL_REGISTRY.bind(
@@ -438,6 +455,8 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
     get_global_cache = getattr(module, "get_global_cache", None)
     if model_cache_cls is None or not callable(get_global_cache):
         return False
+
+    patched_now = False
     with _SEEDVR2_PATCH_LOCK:
         if id(model_cache_cls) in _SEEDVR2_PATCHED_CLASS_IDS:
             return True
@@ -523,28 +542,44 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
             model_cache_cls.replace_vae = replace_vae_wrapper
         model_cache_cls.remove_dit = remove_dit_wrapper
         model_cache_cls.remove_vae = remove_vae_wrapper
-
-        _SEEDVR2_PATCHED_CLASS_IDS.add(id(model_cache_cls))
-    _LOG.info("GPU Resident Loader: integrated external SeedVR2 cache eviction hooks")
+        patched_now = True
 
     global_cache = get_global_cache()
     model_cache_lock = getattr(global_cache, "_model_cache_lock", None)
     lock_context = model_cache_lock if model_cache_lock is not None else contextlib.nullcontext()
-    with lock_context:
-        dit_items = list(getattr(global_cache, "_dit_models", {}).items())
-        vae_items = list(getattr(global_cache, "_vae_models", {}).items())
-    for node_id, entry in dit_items:
-        if not isinstance(entry, tuple) or len(entry) != 2:
-            continue
-        model, config = entry
-        if model is not None:
-            _register_seedvr2_cached_model(global_cache, kind="dit", config=config, model=model)
-    for node_id, entry in vae_items:
-        if not isinstance(entry, tuple) or len(entry) != 2:
-            continue
-        model, config = entry
-        if model is not None:
-            _register_seedvr2_cached_model(global_cache, kind="vae", config=config, model=model)
+    try:
+        with lock_context:
+            dit_items = list(getattr(global_cache, "_dit_models", {}).items())
+            vae_items = list(getattr(global_cache, "_vae_models", {}).items())
+        for node_id, entry in dit_items:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                continue
+            model, config = entry
+            if model is not None:
+                _register_seedvr2_cached_model(global_cache, kind="dit", config=config, model=model)
+        for node_id, entry in vae_items:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                continue
+            model, config = entry
+            if model is not None:
+                _register_seedvr2_cached_model(global_cache, kind="vae", config=config, model=model)
+    except Exception:
+        if patched_now:
+            with _SEEDVR2_PATCH_LOCK:
+                model_cache_cls.set_dit = original_set_dit
+                model_cache_cls.set_vae = original_set_vae
+                if original_replace_dit is not None:
+                    model_cache_cls.replace_dit = original_replace_dit
+                if original_replace_vae is not None:
+                    model_cache_cls.replace_vae = original_replace_vae
+                model_cache_cls.remove_dit = original_remove_dit
+                model_cache_cls.remove_vae = original_remove_vae
+                _SEEDVR2_PATCHED_CLASS_IDS.discard(id(model_cache_cls))
+        raise
+
+    with _SEEDVR2_PATCH_LOCK:
+        _SEEDVR2_PATCHED_CLASS_IDS.add(id(model_cache_cls))
+    _LOG.info("GPU Resident Loader: integrated external SeedVR2 cache eviction hooks")
     return True
 
 
