@@ -14,7 +14,14 @@ import comfy.utils
 from comfy.cli_args import PerformanceFeature, args
 from comfy.ldm.modules.attention import attention_pytorch, wrap_attn
 
-from .patches import checkpoint_component_info_from_header, infer_unet_prefix_from_keys, load_safetensors_state_dict
+from .cleanup import trim_resident_vram_for_load
+from .patches import (
+    checkpoint_component_info_from_header,
+    estimate_checkpoint_component_bytes,
+    estimate_safetensors_tensor_bytes,
+    infer_unet_prefix_from_keys,
+    load_safetensors_state_dict,
+)
 from .residency import KIND_CHECKPOINT, KIND_CLIP, KIND_MODEL, KIND_VAE, POLICIES, REGISTRY
 
 
@@ -328,6 +335,113 @@ def _warn_pickle_checkpoint_gpu_compatibility(loader_name: str, path: str) -> No
     )
 
 
+def _fallback_file_size_bytes(path: str) -> int:
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
+
+
+def _weight_dtype_override(weight_dtype: str) -> torch.dtype | None:
+    if weight_dtype == "fp8_e4m3fn_fast":
+        return torch.float8_e4m3fn
+    return DTYPE_MAP.get(weight_dtype)
+
+
+def _normalize_keep_models(*objects: Any) -> tuple[Any, ...]:
+    keep_models: list[Any] = []
+    for obj in objects:
+        if obj is None:
+            continue
+        patcher = getattr(obj, "patcher", None)
+        keep = patcher if patcher is not None else obj
+        if not any(existing is keep for existing in keep_models):
+            keep_models.append(keep)
+    return tuple(keep_models)
+
+
+def _estimate_extra_state_dict_bytes(extra_state_dict: str | None, *, weight_dtype: str) -> int:
+    if not extra_state_dict:
+        return 0
+    dtype_override = _weight_dtype_override(weight_dtype)
+    if _is_safetensors_path(extra_state_dict):
+        estimated = estimate_safetensors_tensor_bytes(extra_state_dict, dtype_override=dtype_override)
+        if estimated is not None:
+            return int(estimated)
+    return _fallback_file_size_bytes(extra_state_dict)
+
+
+def _estimate_model_load_bytes(
+    source_path: str,
+    *,
+    cache_scope: str,
+    weight_dtype: str,
+    extra_state_dict: str | None,
+) -> int:
+    dtype_override = _weight_dtype_override(weight_dtype)
+    estimated = None
+    if _is_safetensors_path(source_path):
+        if cache_scope == "checkpoint_model":
+            estimated = estimate_checkpoint_component_bytes(
+                source_path,
+                KIND_MODEL,
+                dtype_override=dtype_override,
+            )
+        else:
+            estimated = estimate_safetensors_tensor_bytes(source_path, dtype_override=dtype_override)
+    if estimated is None:
+        estimated = _fallback_file_size_bytes(source_path)
+    return int(estimated) + _estimate_extra_state_dict_bytes(extra_state_dict, weight_dtype=weight_dtype)
+
+
+def _estimate_checkpoint_aux_component_bytes(ckpt_path: str, *, kind: str) -> int:
+    estimated = None
+    if _is_safetensors_path(ckpt_path):
+        estimated = estimate_checkpoint_component_bytes(ckpt_path, kind)
+    if estimated is None:
+        estimated = _fallback_file_size_bytes(ckpt_path)
+    return int(estimated)
+
+
+def _maybe_trim_before_load(
+    *,
+    loader_name: str,
+    reason: str,
+    explicit_device: torch.device | None,
+    required_bytes: int,
+    keep_models: tuple[Any, ...] = (),
+) -> None:
+    if explicit_device is None or explicit_device.type != "cuda":
+        return
+    if required_bytes <= 0:
+        return
+
+    report = trim_resident_vram_for_load(
+        required_bytes=required_bytes,
+        reason=reason,
+        device=explicit_device,
+        keep_models=keep_models,
+    )
+    if report["freed_vram_bytes"] > 0:
+        _LOG.info(
+            "%s: adaptively freed %.2f GiB before load (%s, estimated %.2f GiB + %.2f GiB headroom)",
+            loader_name,
+            report["freed_vram_bytes"] / (1024 ** 3),
+            report["stopped_reason"],
+            report["estimated_load_bytes"] / (1024 ** 3),
+            report["adaptive_headroom_bytes"] / (1024 ** 3),
+        )
+    if not report["target_met"]:
+        _LOG.warning(
+            "%s: adaptive trim could not reach the estimated headroom for %s (%s, free %.2f GiB / target %.2f GiB)",
+            loader_name,
+            reason,
+            report["stopped_reason"],
+            report["free_after_bytes"] / (1024 ** 3),
+            report["target_free_vram_bytes"] / (1024 ** 3),
+        )
+
+
 def _selected_unet_key_map_from_header(
     path: str,
     *,
@@ -485,6 +599,7 @@ def _load_resident_diffusion_model(
     enable_fp16_accumulation: bool,
     extra_state_dict: str | None = None,
     policy_override: str | None = None,
+    keep_models: tuple[Any, ...] = (),
 ) -> Any:
     model_options = _build_model_options(weight_dtype)
     effective_policy = _effective_policy_name(policy_override)
@@ -506,6 +621,18 @@ def _load_resident_diffusion_model(
 
     _warn_pickle_checkpoint_gpu_compatibility(loader_name, source_path)
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_MODEL, source_path=source_path)
+    _maybe_trim_before_load(
+        loader_name=loader_name,
+        reason=f"model load for {os.path.basename(source_path)}",
+        explicit_device=explicit_device,
+        required_bytes=_estimate_model_load_bytes(
+            source_path,
+            cache_scope=cache_scope,
+            weight_dtype=weight_dtype,
+            extra_state_dict=extra_state_dict,
+        ),
+        keep_models=keep_models,
+    )
 
     with _temporary_backend_flags(
         cublas=patch_cublaslinear,
@@ -568,6 +695,7 @@ def _load_checkpoint_clip_only(
     ckpt_path: str,
     policy_override: str | None,
     loader_name: str,
+    keep_models: tuple[Any, ...] = (),
 ):
     loader_key = _checkpoint_component_loader_key("clip", policy_override)
     reused_clip = REGISTRY.lookup_live_object(kind=KIND_CLIP, source_path=ckpt_path, loader_key=loader_key)
@@ -580,6 +708,13 @@ def _load_checkpoint_clip_only(
     header_info = checkpoint_component_info_from_header(ckpt_path) if is_safetensors else None
     model_config = None if header_info is None else header_info.get("model_config")
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_CLIP, source_path=ckpt_path)
+    _maybe_trim_before_load(
+        loader_name=loader_name,
+        reason=f"CLIP load for {os.path.basename(ckpt_path)}",
+        explicit_device=explicit_device,
+        required_bytes=_estimate_checkpoint_aux_component_bytes(ckpt_path, kind=KIND_CLIP),
+        keep_models=keep_models,
+    )
     with REGISTRY.load_context(kind=KIND_CLIP, source_path=ckpt_path, explicit_device=explicit_device, cache_key=loader_key):
         if is_safetensors and model_config is None:
             requested_device = explicit_device if explicit_device is not None else torch.device("cpu")
@@ -646,6 +781,7 @@ def _load_checkpoint_vae_only(
     ckpt_path: str,
     policy_override: str | None,
     loader_name: str,
+    keep_models: tuple[Any, ...] = (),
 ):
     loader_key = _checkpoint_component_loader_key("vae", policy_override)
     reused_vae = REGISTRY.lookup_live_object(kind=KIND_VAE, source_path=ckpt_path, loader_key=loader_key)
@@ -658,6 +794,13 @@ def _load_checkpoint_vae_only(
     header_info = checkpoint_component_info_from_header(ckpt_path) if is_safetensors else None
     model_config = None if header_info is None else header_info.get("model_config")
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_VAE, source_path=ckpt_path)
+    _maybe_trim_before_load(
+        loader_name=loader_name,
+        reason=f"VAE load for {os.path.basename(ckpt_path)}",
+        explicit_device=explicit_device,
+        required_bytes=_estimate_checkpoint_aux_component_bytes(ckpt_path, kind=KIND_VAE),
+        keep_models=keep_models,
+    )
     with REGISTRY.load_context(kind=KIND_VAE, source_path=ckpt_path, explicit_device=explicit_device, cache_key=loader_key):
         if is_safetensors and model_config is None:
             requested_device = explicit_device if explicit_device is not None else torch.device("cpu")
@@ -724,6 +867,7 @@ def _load_full_checkpoint(
         _LOG.info("%s: reusing live checkpoint outputs for %s", loader_name, ckpt_path)
         return model, clip, vae
 
+    keep_models = _normalize_keep_models(model, clip, vae)
     if model is None:
         model = _load_resident_diffusion_model(
             loader_name=loader_name,
@@ -736,18 +880,23 @@ def _load_full_checkpoint(
             sage_attention=sage_attention,
             enable_fp16_accumulation=enable_fp16_accumulation,
             policy_override=policy_override,
+            keep_models=keep_models,
         )
+        keep_models = keep_models + _normalize_keep_models(model)
     if clip is None:
         clip = _load_checkpoint_clip_only(
             ckpt_path=ckpt_path,
             policy_override=policy_override,
             loader_name=loader_name,
+            keep_models=keep_models,
         )
+        keep_models = keep_models + _normalize_keep_models(clip)
     if vae is None:
         vae = _load_checkpoint_vae_only(
             ckpt_path=ckpt_path,
             policy_override=policy_override,
             loader_name=loader_name,
+            keep_models=keep_models,
         )
     return model, clip, vae
 

@@ -4,12 +4,26 @@ import os
 from typing import Any
 
 import comfy.model_management as model_management
+import torch
 
 from .residency import REGISTRY
+
+_ADAPTIVE_HEADROOM_RATIO = 0.125
+_ADAPTIVE_HEADROOM_FLOOR_BYTES = 256 * 1024 * 1024
+_ADAPTIVE_HEADROOM_CEIL_BYTES = 1024 * 1024 * 1024
 
 
 def _safe_free_memory(device) -> int:
     return int(model_management.get_free_memory(device))
+
+
+def _normalize_trim_device(device: str | torch.device | None):
+    if device is None or isinstance(device, torch.device):
+        return device
+    try:
+        return torch.device(device)
+    except Exception:
+        return device
 
 
 def _safe_is_dead(loaded) -> bool:
@@ -27,7 +41,31 @@ def _sort_key_for_candidate(entry, *, sticky_respected: bool) -> tuple[int, int,
     return (1, priority, last_touched)
 
 
-def _trim_candidates(*, device, respect_sticky: bool, sticky_floor_priority: int) -> list[tuple[Any, Any, bool]]:
+def _should_keep_loaded_model(model: Any, keep_models: tuple[Any, ...]) -> bool:
+    if not keep_models:
+        return False
+    for keep in keep_models:
+        if keep is None:
+            continue
+        if model is keep:
+            return True
+        is_clone = getattr(model, "is_clone", None)
+        if callable(is_clone):
+            try:
+                if is_clone(keep):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _trim_candidates(
+    *,
+    device,
+    respect_sticky: bool,
+    sticky_floor_priority: int,
+    keep_models: tuple[Any, ...],
+) -> list[tuple[Any, Any, bool]]:
     candidates: list[tuple[Any, Any, bool]] = []
     for loaded in list(model_management.current_loaded_models):
         if device is not None and loaded.device != device:
@@ -37,6 +75,8 @@ def _trim_candidates(*, device, respect_sticky: bool, sticky_floor_priority: int
 
         model = getattr(loaded, "model", None)
         if model is None:
+            continue
+        if _should_keep_loaded_model(model, keep_models):
             continue
 
         entry = REGISTRY.entry_for_object(model)
@@ -54,17 +94,21 @@ def _trim_candidates(*, device, respect_sticky: bool, sticky_floor_priority: int
 
 def trim_resident_vram(
     *,
+    device: str | torch.device | None = None,
     target_free_vram_bytes: int,
     respect_sticky: bool,
     sticky_floor_priority: int,
     allow_partial_unload: bool,
+    keep_models: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
     cleanup_models_gc = getattr(model_management, "cleanup_models_gc", None)
     if callable(cleanup_models_gc):
         cleanup_models_gc()
 
     REGISTRY.refresh_runtime_state()
-    device = model_management.get_torch_device()
+    device = _normalize_trim_device(device)
+    if device is None:
+        device = model_management.get_torch_device()
     free_before = _safe_free_memory(device)
     actions: list[dict[str, Any]] = []
     soft_empty_cache = getattr(model_management, "soft_empty_cache", None)
@@ -81,6 +125,7 @@ def trim_resident_vram(
             device=device,
             respect_sticky=respect_sticky,
             sticky_floor_priority=sticky_floor_priority,
+            keep_models=keep_models,
         )
         if not candidates:
             stopped_reason = "no_candidates"
@@ -170,3 +215,43 @@ def trim_resident_vram(
         "allow_partial_unload": bool(allow_partial_unload),
         "actions": actions,
     }
+
+
+def adaptive_headroom_bytes(required_bytes: int) -> int:
+    required = max(0, int(required_bytes))
+    if required == 0:
+        return 0
+    return min(
+        _ADAPTIVE_HEADROOM_CEIL_BYTES,
+        max(_ADAPTIVE_HEADROOM_FLOOR_BYTES, int(required * _ADAPTIVE_HEADROOM_RATIO)),
+    )
+
+
+def trim_resident_vram_for_load(
+    *,
+    required_bytes: int,
+    reason: str,
+    device: str | torch.device | None = None,
+    respect_sticky: bool = True,
+    sticky_floor_priority: int = 0,
+    allow_partial_unload: bool = True,
+    keep_models: tuple[Any, ...] = (),
+) -> dict[str, Any]:
+    estimated_load_bytes = max(0, int(required_bytes))
+    headroom_bytes = adaptive_headroom_bytes(estimated_load_bytes)
+    target_free_vram_bytes = estimated_load_bytes + headroom_bytes
+
+    report = trim_resident_vram(
+        device=device,
+        target_free_vram_bytes=target_free_vram_bytes,
+        respect_sticky=respect_sticky,
+        sticky_floor_priority=sticky_floor_priority,
+        allow_partial_unload=allow_partial_unload,
+        keep_models=keep_models,
+    )
+    report["trim_strategy"] = "adaptive_load_request"
+    report["trim_reason"] = str(reason)
+    report["estimated_load_bytes"] = estimated_load_bytes
+    report["adaptive_headroom_bytes"] = headroom_bytes
+    report["kept_loaded_models"] = len([model for model in keep_models if model is not None])
+    return report

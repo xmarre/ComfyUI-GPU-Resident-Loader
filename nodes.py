@@ -5,7 +5,6 @@ from typing import Any
 
 import comfy.model_management as model_management
 
-from .cleanup import trim_resident_vram
 from .kj_loader import (
     CheckpointClipLoaderResident,
     CheckpointLoaderResident,
@@ -332,54 +331,6 @@ class ReportVAEResidency:
         return (_entry_report_json(_patcher_for_vae(vae)),)
 
 
-class TrimResidentVRAM:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "target_free_vram_mb": ("INT", {"default": 4096, "min": 0, "max": 1_048_576, "step": 1}),
-                "respect_sticky": ("BOOLEAN", {"default": True}),
-                "sticky_floor_priority": ("INT", {"default": 0, "min": -100, "max": 1000, "step": 1}),
-                "allow_partial_unload": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "payload": (
-                    "*",
-                    {
-                        "forceInput": True,
-                        "tooltip": "Optional passthrough payload so the trim can sit on a stage boundary without changing graph data.",
-                    },
-                ),
-            },
-        }
-
-    RETURN_TYPES = ("*", "STRING")
-    RETURN_NAMES = ("payload", "trim_report")
-    FUNCTION = "trim"
-    CATEGORY = "GPU Resident Loader/residency"
-    DESCRIPTION = (
-        "Resident-aware VRAM trimmer. It frees only enough VRAM to reach the target budget, "
-        "tries partial unload before full detach, orders sticky entries behind non-sticky work unless their priority falls below the floor, "
-        "and returns a JSON report describing whether the target was met, only partially met, or failed."
-    )
-
-    def trim(
-        self,
-        target_free_vram_mb: int,
-        respect_sticky: bool,
-        sticky_floor_priority: int,
-        allow_partial_unload: bool,
-        payload=None,
-    ):
-        report = trim_resident_vram(
-            target_free_vram_bytes=max(0, int(target_free_vram_mb)) * 1024 * 1024,
-            respect_sticky=respect_sticky,
-            sticky_floor_priority=sticky_floor_priority,
-            allow_partial_unload=allow_partial_unload,
-        )
-        return payload, json.dumps(report, indent=2, sort_keys=True)
-
-
 NODE_CLASS_MAPPINGS = {
     "DiffusionModelSelectorResident": DiffusionModelSelectorResident,
     "DiffusionModelLoaderResident": DiffusionModelLoaderResident,
@@ -401,7 +352,6 @@ NODE_CLASS_MAPPINGS = {
     "ReportModelResidency": ReportModelResidency,
     "ReportClipResidency": ReportClipResidency,
     "ReportVAEResidency": ReportVAEResidency,
-    "TrimResidentVRAM": TrimResidentVRAM,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -425,5 +375,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ReportModelResidency": "Report Model Residency",
     "ReportClipResidency": "Report CLIP Residency",
     "ReportVAEResidency": "Report VAE Residency",
-    "TrimResidentVRAM": "Trim Resident VRAM",
 }

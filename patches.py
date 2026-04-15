@@ -72,6 +72,18 @@ def _torch_dtype_from_safetensors_code(code: str | None) -> torch.dtype:
     return _SAFETENSORS_DTYPE_MAP.get(code, torch.float32)
 
 
+def _tensor_nbytes_from_header(
+    tensor_info: dict[str, Any],
+    *,
+    dtype_override: torch.dtype | None = None,
+) -> int:
+    dtype = dtype_override if dtype_override is not None else _torch_dtype_from_safetensors_code(tensor_info.get("dtype"))
+    numel = 1
+    for dim in tensor_info.get("shape", ()):
+        numel *= int(dim)
+    return int(numel) * int(torch.empty((), dtype=dtype).element_size())
+
+
 def _build_meta_state_dict_from_header(tensor_headers: dict[str, dict[str, Any]]) -> dict[str, torch.Tensor]:
     meta_state_dict: dict[str, torch.Tensor] = {}
     for key, tensor_info in tensor_headers.items():
@@ -120,6 +132,55 @@ def checkpoint_component_info_from_header(path: str) -> dict[str, Any] | None:
     except Exception as exc:
         _LOG.warning("GPU Resident Loader: failed to build selective safetensors header map for %s: %s", path, exc)
         return None
+
+
+def estimate_safetensors_tensor_bytes(
+    path: str,
+    *,
+    selected_keys: list[str] | tuple[str, ...] | set[str] | None = None,
+    dtype_override: torch.dtype | None = None,
+) -> int | None:
+    try:
+        tensor_headers, _ = _read_safetensors_header(path)
+    except Exception as exc:
+        _LOG.warning("GPU Resident Loader: failed to estimate safetensors tensor bytes for %s: %s", path, exc)
+        return None
+
+    selected = None if selected_keys is None else set(selected_keys)
+    total = 0
+    matched = 0
+    for key, tensor_info in tensor_headers.items():
+        if selected is not None and key not in selected:
+            continue
+        total += _tensor_nbytes_from_header(tensor_info, dtype_override=dtype_override)
+        matched += 1
+    if selected is not None and selected and matched == 0:
+        _LOG.warning(
+            "GPU Resident Loader: selected tensor keys were provided but none matched %s; "
+            "treating size as unknown for fallback",
+            path,
+        )
+        return None
+    return int(total)
+
+
+def estimate_checkpoint_component_bytes(
+    path: str,
+    kind: str,
+    *,
+    dtype_override: torch.dtype | None = None,
+) -> int | None:
+    component_maps = checkpoint_component_info_from_header(path)
+    if component_maps is None:
+        return None
+    pairs = component_maps.get(kind, ())
+    if not pairs:
+        return None
+    return estimate_safetensors_tensor_bytes(
+        path,
+        selected_keys=[source_key for source_key, _ in pairs],
+        dtype_override=dtype_override,
+    )
 
 
 def _selected_component_keys_from_header(path: str, kind: str) -> dict[str, str] | None:
