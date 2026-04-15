@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import logging
 import os
 import sys
@@ -16,6 +17,7 @@ from .residency import KIND_MODEL, KIND_VAE, REGISTRY
 
 _LOG = logging.getLogger(__name__)
 _SEEDVR2_PATCHED_CLASS_IDS: set[int] = set()
+_SEEDVR2_PATCH_LOCK = threading.Lock()
 
 
 def _now() -> float:
@@ -131,8 +133,14 @@ def _seedvr2_source_path(kind: str, node_id: Any, config: dict[str, Any], model:
     return f"seedvr2/{kind}/{node_id}/{model_name}"
 
 
-def _seedvr2_state_provider(model: Any, config: dict[str, Any]) -> Callable[[], dict[str, Any]]:
+def _seedvr2_state_provider(
+    model_ref: Callable[[], Any | None],
+    config: dict[str, Any],
+) -> Callable[[], dict[str, Any]]:
     def provider() -> dict[str, Any]:
+        model = model_ref()
+        if model is None:
+            return {}
         total_bytes = _unique_tensor_nbytes(model)
         return {
             "current_device": _first_tensor_device(model),
@@ -201,10 +209,13 @@ class ExternalResidencyRegistry:
         self._lock = threading.RLock()
         self._entries: dict[str, ExternalResidencyEntry] = {}
         self._cache_key_to_entry: dict[str, str] = {}
+        self._next_entry_seq = 1
 
     def _make_entry_id(self, kind: str, source_path: str) -> str:
         basename = os.path.basename(source_path) or "anonymous"
-        return f"external:{kind}:{basename}:{len(self._entries) + 1}"
+        entry_id = f"external:{kind}:{basename}:{self._next_entry_seq}"
+        self._next_entry_seq += 1
+        return entry_id
 
     def bind(
         self,
@@ -350,10 +361,35 @@ class ExternalResidencyRegistry:
 EXTERNAL_REGISTRY = ExternalResidencyRegistry()
 
 
+def _call_seedvr2_method_with_optional_expected_model(
+    method: Callable[..., Any],
+    *args: Any,
+    debug: Any = None,
+    expected_model: Any = None,
+) -> Any:
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+
+    accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+    kwargs: dict[str, Any] = {}
+    if accepts_kwargs or "debug" in parameters:
+        kwargs["debug"] = debug
+    if expected_model is not None and (accepts_kwargs or "expected_model" in parameters):
+        kwargs["expected_model"] = expected_model
+    return method(*args, **kwargs)
+
+
 def _register_seedvr2_cached_model(global_cache: Any, *, kind: str, config: dict[str, Any], model: Any) -> None:
     node_id = config.get("node_id")
     if node_id is None or model is None:
         return
+
+    try:
+        model_ref = weakref.ref(model)
+    except TypeError:
+        model_ref = lambda: None
 
     source_path = _seedvr2_source_path(kind, node_id, config, model)
     cache_key = _seedvr2_entry_key(kind, node_id)
@@ -371,7 +407,7 @@ def _register_seedvr2_cached_model(global_cache: Any, *, kind: str, config: dict
         obj=model,
         kind=registry_kind,
         source_path=source_path,
-        state_provider=_seedvr2_state_provider(model, config),
+        state_provider=_seedvr2_state_provider(model_ref, config),
         evict_callback=evict_callback,
         sticky=False,
         priority=REGISTRY.default_priority(registry_kind),
@@ -384,66 +420,93 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
     get_global_cache = getattr(module, "get_global_cache", None)
     if model_cache_cls is None or not callable(get_global_cache):
         return False
-    if id(model_cache_cls) in _SEEDVR2_PATCHED_CLASS_IDS:
-        return True
+    with _SEEDVR2_PATCH_LOCK:
+        if id(model_cache_cls) in _SEEDVR2_PATCHED_CLASS_IDS:
+            return True
 
-    original_set_dit = model_cache_cls.set_dit
-    original_set_vae = model_cache_cls.set_vae
-    original_replace_dit = getattr(model_cache_cls, "replace_dit", None)
-    original_replace_vae = getattr(model_cache_cls, "replace_vae", None)
-    original_remove_dit = model_cache_cls.remove_dit
-    original_remove_vae = model_cache_cls.remove_vae
+        original_set_dit = model_cache_cls.set_dit
+        original_set_vae = model_cache_cls.set_vae
+        original_replace_dit = getattr(model_cache_cls, "replace_dit", None)
+        original_replace_vae = getattr(model_cache_cls, "replace_vae", None)
+        original_remove_dit = model_cache_cls.remove_dit
+        original_remove_vae = model_cache_cls.remove_vae
 
-    def set_dit_wrapper(self, dit_config, model, model_name, debug=None):
-        result = original_set_dit(self, dit_config, model, model_name, debug)
-        if result is not None:
-            _register_seedvr2_cached_model(self, kind="dit", config=dit_config, model=model)
-        return result
+        def set_dit_wrapper(self, dit_config, model, model_name, debug=None):
+            result = original_set_dit(self, dit_config, model, model_name, debug)
+            if result is not None:
+                _register_seedvr2_cached_model(self, kind="dit", config=dit_config, model=model)
+            return result
 
-    def set_vae_wrapper(self, vae_config, model, model_name, debug=None):
-        result = original_set_vae(self, vae_config, model, model_name, debug)
-        if result is not None:
-            _register_seedvr2_cached_model(self, kind="vae", config=vae_config, model=model)
-        return result
+        def set_vae_wrapper(self, vae_config, model, model_name, debug=None):
+            result = original_set_vae(self, vae_config, model, model_name, debug)
+            if result is not None:
+                _register_seedvr2_cached_model(self, kind="vae", config=vae_config, model=model)
+            return result
 
-    def replace_dit_wrapper(self, dit_config, model, debug=None, expected_model=None):
-        if original_replace_dit is None:
-            return False
-        result = original_replace_dit(self, dit_config, model, debug, expected_model)
-        if result:
-            _register_seedvr2_cached_model(self, kind="dit", config=dit_config, model=model)
-        return result
+        def replace_dit_wrapper(self, dit_config, model, debug=None, expected_model=None):
+            if original_replace_dit is None:
+                return False
+            result = _call_seedvr2_method_with_optional_expected_model(
+                original_replace_dit,
+                self,
+                dit_config,
+                model,
+                debug=debug,
+                expected_model=expected_model,
+            )
+            if result:
+                _register_seedvr2_cached_model(self, kind="dit", config=dit_config, model=model)
+            return result
 
-    def replace_vae_wrapper(self, vae_config, model, debug=None, expected_model=None):
-        if original_replace_vae is None:
-            return False
-        result = original_replace_vae(self, vae_config, model, debug, expected_model)
-        if result:
-            _register_seedvr2_cached_model(self, kind="vae", config=vae_config, model=model)
-        return result
+        def replace_vae_wrapper(self, vae_config, model, debug=None, expected_model=None):
+            if original_replace_vae is None:
+                return False
+            result = _call_seedvr2_method_with_optional_expected_model(
+                original_replace_vae,
+                self,
+                vae_config,
+                model,
+                debug=debug,
+                expected_model=expected_model,
+            )
+            if result:
+                _register_seedvr2_cached_model(self, kind="vae", config=vae_config, model=model)
+            return result
 
-    def remove_dit_wrapper(self, dit_config, debug=None, expected_model=None):
-        result = original_remove_dit(self, dit_config, debug, expected_model)
-        if result:
-            EXTERNAL_REGISTRY.remove(cache_key=_seedvr2_entry_key("dit", dit_config.get("node_id")))
-        return result
+        def remove_dit_wrapper(self, dit_config, debug=None, expected_model=None):
+            result = _call_seedvr2_method_with_optional_expected_model(
+                original_remove_dit,
+                self,
+                dit_config,
+                debug=debug,
+                expected_model=expected_model,
+            )
+            if result:
+                EXTERNAL_REGISTRY.remove(cache_key=_seedvr2_entry_key("dit", dit_config.get("node_id")))
+            return result
 
-    def remove_vae_wrapper(self, vae_config, debug=None, expected_model=None):
-        result = original_remove_vae(self, vae_config, debug, expected_model)
-        if result:
-            EXTERNAL_REGISTRY.remove(cache_key=_seedvr2_entry_key("vae", vae_config.get("node_id")))
-        return result
+        def remove_vae_wrapper(self, vae_config, debug=None, expected_model=None):
+            result = _call_seedvr2_method_with_optional_expected_model(
+                original_remove_vae,
+                self,
+                vae_config,
+                debug=debug,
+                expected_model=expected_model,
+            )
+            if result:
+                EXTERNAL_REGISTRY.remove(cache_key=_seedvr2_entry_key("vae", vae_config.get("node_id")))
+            return result
 
-    model_cache_cls.set_dit = set_dit_wrapper
-    model_cache_cls.set_vae = set_vae_wrapper
-    if original_replace_dit is not None:
-        model_cache_cls.replace_dit = replace_dit_wrapper
-    if original_replace_vae is not None:
-        model_cache_cls.replace_vae = replace_vae_wrapper
-    model_cache_cls.remove_dit = remove_dit_wrapper
-    model_cache_cls.remove_vae = remove_vae_wrapper
+        model_cache_cls.set_dit = set_dit_wrapper
+        model_cache_cls.set_vae = set_vae_wrapper
+        if original_replace_dit is not None:
+            model_cache_cls.replace_dit = replace_dit_wrapper
+        if original_replace_vae is not None:
+            model_cache_cls.replace_vae = replace_vae_wrapper
+        model_cache_cls.remove_dit = remove_dit_wrapper
+        model_cache_cls.remove_vae = remove_vae_wrapper
 
-    _SEEDVR2_PATCHED_CLASS_IDS.add(id(model_cache_cls))
+        _SEEDVR2_PATCHED_CLASS_IDS.add(id(model_cache_cls))
     _LOG.info("GPU Resident Loader: integrated external SeedVR2 cache eviction hooks")
 
     global_cache = get_global_cache()
