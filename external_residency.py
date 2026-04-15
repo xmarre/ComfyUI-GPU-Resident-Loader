@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import contextlib
 import dataclasses
 import inspect
@@ -340,9 +341,18 @@ class ExternalResidencyRegistry:
         callback = entry.evict_callback
         if callback is None:
             return False
-        result = callback()
-        self.refresh_runtime_state()
-        return bool(result)
+        try:
+            result = bool(callback())
+        except Exception as exc:
+            _LOG.warning(
+                "GPU Resident Loader: external eviction callback failed for %s: %s",
+                entry.cache_key,
+                exc,
+            )
+            result = False
+        finally:
+            self.refresh_runtime_state()
+        return result
 
     def snapshot(self) -> list[dict[str, Any]]:
         self.refresh_runtime_state()
@@ -381,7 +391,15 @@ def _call_seedvr2_method_with_optional_expected_model(
     return method(*args, **kwargs)
 
 
-def _register_seedvr2_cached_model(global_cache: Any, *, kind: str, config: dict[str, Any], model: Any) -> None:
+def _register_seedvr2_cached_model(global_cache: Any, *, kind: str, config: Any, model: Any) -> None:
+    if not isinstance(config, Mapping):
+        _LOG.debug(
+            "GPU Resident Loader: skipping SeedVR2 %s cache entry with unexpected config type: %s",
+            kind,
+            type(config).__name__,
+        )
+        return
+
     node_id = config.get("node_id")
     if node_id is None or model is None:
         return
@@ -543,4 +561,11 @@ def ensure_external_integrations_installed() -> None:
         if "seedvr2" not in normalized_file.lower():
             continue
         if hasattr(module, "GlobalModelCache") and hasattr(module, "get_global_cache"):
-            _install_seedvr2_integration_for_module(module)
+            try:
+                _install_seedvr2_integration_for_module(module)
+            except Exception as exc:
+                _LOG.warning(
+                    "GPU Resident Loader: failed to install SeedVR2 external integration from %s: %s",
+                    normalized_file,
+                    exc,
+                )
