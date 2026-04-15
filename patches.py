@@ -166,7 +166,7 @@ def estimate_checkpoint_component_bytes(
         return None
     pairs = component_maps.get(kind, ())
     if not pairs:
-        return 0
+        return None
     return estimate_safetensors_tensor_bytes(
         path,
         selected_keys=[source_key for source_key, _ in pairs],
