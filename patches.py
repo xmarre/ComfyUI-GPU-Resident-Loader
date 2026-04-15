@@ -641,6 +641,165 @@ def _wrap_load_clip(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _sticky_safe_batch_number(*, batch_count: int, free_memory: int, memory_used: int, device: Any) -> int:
+    batches = max(1, int(max(0, int(free_memory)) / max(1, int(memory_used))))
+    batches = min(max(1, int(batch_count)), batches)
+    if REGISTRY.get_policy() != "sticky_gpu" or device is None:
+        return batches
+
+    reserve = max(0, _sticky_protection_target(memory_used, device) - max(0, int(memory_used)))
+    safe_budget = max(0, int(free_memory) - reserve)
+    safe_batches = max(1, int(safe_budget / max(1, int(memory_used))))
+    capped = min(batches, safe_batches)
+    if capped < batches:
+        _LOG.debug(
+            "GPU Resident Loader: capped VAE batch from %s to %s to preserve %s bytes of transient headroom.",
+            batches,
+            capped,
+            reserve,
+        )
+    return max(1, capped)
+
+
+def _wrap_vae_encode(func: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(func)
+    def wrapper(self, pixel_samples):
+        if REGISTRY.get_policy() != "sticky_gpu":
+            return func(self, pixel_samples)
+
+        import comfy.model_management as model_management
+
+        self.throw_exception_if_invalid()
+        pixel_samples = self.vae_encode_crop_pixels(pixel_samples)
+        pixel_samples = pixel_samples.movedim(-1, 1)
+        do_tile = False
+        if self.latent_dim == 3 and pixel_samples.ndim < 5:
+            if not self.not_video:
+                pixel_samples = pixel_samples.movedim(1, 0).unsqueeze(0)
+            else:
+                pixel_samples = pixel_samples.unsqueeze(2)
+        try:
+            memory_used = self.memory_used_encode(pixel_samples.shape, self.vae_dtype)
+            model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
+            free_memory = self.patcher.get_free_memory(self.device)
+            batch_number = _sticky_safe_batch_number(
+                batch_count=pixel_samples.shape[0],
+                free_memory=free_memory,
+                memory_used=memory_used,
+                device=self.device,
+            )
+            samples = None
+            for x in range(0, pixel_samples.shape[0], batch_number):
+                pixels_in = self.process_input(pixel_samples[x:x + batch_number]).to(self.vae_dtype)
+                if getattr(self.first_stage_model, "comfy_has_chunked_io", False):
+                    out = self.first_stage_model.encode(pixels_in, device=self.device)
+                else:
+                    pixels_in = pixels_in.to(self.device)
+                    out = self.first_stage_model.encode(pixels_in)
+                out = out.to(self.output_device).to(dtype=self.vae_output_dtype())
+                if samples is None:
+                    samples = torch.empty(
+                        (pixel_samples.shape[0],) + tuple(out.shape[1:]),
+                        device=self.output_device,
+                        dtype=self.vae_output_dtype(),
+                    )
+                samples[x:x + batch_number] = out
+        except Exception as e:
+            model_management.raise_non_oom(e)
+            _LOG.warning("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")
+            do_tile = True
+
+        if do_tile:
+            model_management.soft_empty_cache()
+            if self.latent_dim == 3:
+                tile = 256
+                overlap = tile // 4
+                samples = self.encode_tiled_3d(pixel_samples, tile_x=tile, tile_y=tile, overlap=(1, overlap, overlap))
+            elif self.latent_dim == 1 or self.extra_1d_channel is not None:
+                samples = self.encode_tiled_1d(pixel_samples)
+            else:
+                samples = self.encode_tiled_(pixel_samples)
+
+        return samples
+
+    return wrapper
+
+
+def _wrap_vae_decode(func: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(func)
+    def wrapper(self, samples_in, vae_options={}):
+        if REGISTRY.get_policy() != "sticky_gpu":
+            return func(self, samples_in, vae_options)
+
+        import comfy.model_management as model_management
+
+        self.throw_exception_if_invalid()
+        pixel_samples = None
+        do_tile = False
+        if self.latent_dim == 2 and samples_in.ndim == 5:
+            samples_in = samples_in[:, :, 0]
+        try:
+            memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
+            model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
+            free_memory = self.patcher.get_free_memory(self.device)
+            batch_number = _sticky_safe_batch_number(
+                batch_count=samples_in.shape[0],
+                free_memory=free_memory,
+                memory_used=memory_used,
+                device=self.device,
+            )
+
+            preallocated = False
+            if getattr(self.first_stage_model, "comfy_has_chunked_io", False):
+                pixel_samples = torch.empty(
+                    self.first_stage_model.decode_output_shape(samples_in.shape),
+                    device=self.output_device,
+                    dtype=self.vae_output_dtype(),
+                )
+                preallocated = True
+
+            for x in range(0, samples_in.shape[0], batch_number):
+                samples = samples_in[x:x + batch_number].to(device=self.device, dtype=self.vae_dtype)
+                if preallocated:
+                    self.first_stage_model.decode(samples, output_buffer=pixel_samples[x:x + batch_number], **vae_options)
+                else:
+                    out = self.first_stage_model.decode(samples, **vae_options).to(
+                        device=self.output_device,
+                        dtype=self.vae_output_dtype(),
+                        copy=True,
+                    )
+                    if pixel_samples is None:
+                        pixel_samples = torch.empty(
+                            (samples_in.shape[0],) + tuple(out.shape[1:]),
+                            device=self.output_device,
+                            dtype=self.vae_output_dtype(),
+                        )
+                    pixel_samples[x:x + batch_number].copy_(out)
+                    del out
+                self.process_output(pixel_samples[x:x + batch_number])
+        except Exception as e:
+            model_management.raise_non_oom(e)
+            _LOG.warning("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
+            do_tile = True
+
+        if do_tile:
+            model_management.soft_empty_cache()
+            dims = samples_in.ndim - 2
+            if dims == 1 or self.extra_1d_channel is not None:
+                pixel_samples = self.decode_tiled_1d(samples_in)
+            elif dims == 2:
+                pixel_samples = self.decode_tiled_(samples_in)
+            elif dims == 3:
+                tile = 256 // self.spacial_compression_decode()
+                overlap = tile // 4
+                pixel_samples = self.decode_tiled_3d(samples_in, tile_x=tile, tile_y=tile, overlap=(1, overlap, overlap))
+
+        pixel_samples = pixel_samples.to(self.output_device).movedim(1, -1)
+        return pixel_samples
+
+    return wrapper
+
+
 def _wrap_load_models_gpu(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(models, *args, **kwargs):
@@ -916,6 +1075,14 @@ def install_patches() -> None:
     original_load_clip = _remember_original("sd.load_clip", comfy_sd.load_clip)
     if comfy_sd.load_clip is original_load_clip:
         comfy_sd.load_clip = _wrap_load_clip(original_load_clip)
+
+    original_vae_encode = _remember_original("sd.VAE.encode", comfy_sd.VAE.encode)
+    if comfy_sd.VAE.encode is original_vae_encode:
+        comfy_sd.VAE.encode = _wrap_vae_encode(original_vae_encode)
+
+    original_vae_decode = _remember_original("sd.VAE.decode", comfy_sd.VAE.decode)
+    if comfy_sd.VAE.decode is original_vae_decode:
+        comfy_sd.VAE.decode = _wrap_vae_decode(original_vae_decode)
 
     original_clip_vision_load = _remember_original("clip_vision.load", clip_vision.load)
     if clip_vision.load is original_clip_vision_load:
