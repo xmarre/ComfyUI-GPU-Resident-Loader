@@ -148,10 +148,19 @@ def estimate_safetensors_tensor_bytes(
 
     selected = None if selected_keys is None else set(selected_keys)
     total = 0
+    matched = 0
     for key, tensor_info in tensor_headers.items():
         if selected is not None and key not in selected:
             continue
         total += _tensor_nbytes_from_header(tensor_info, dtype_override=dtype_override)
+        matched += 1
+    if selected is not None and selected and matched == 0:
+        _LOG.warning(
+            "GPU Resident Loader: selected tensor keys were provided but none matched %s; "
+            "treating size as unknown for fallback",
+            path,
+        )
+        return None
     return int(total)
 
 
