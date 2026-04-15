@@ -1,32 +1,41 @@
 # ComfyUI GPU Resident Loader
 
-A ComfyUI custom-node pack that targets **time-to-VRAM** and **sticky GPU residency**, not just lower peak host RAM.
+A ComfyUI custom-node pack for **faster time-to-VRAM**, **selective safetensors loading**, and **sticky GPU residency control**.
 
-It does two things:
+This repo does three related jobs:
 
-1. **Installs startup-time loader and residency patches** before any workflow nodes run.
-2. Ships **KJ-compatible loader nodes** for diffusion models and checkpoints, plus preload/pin/evict/report nodes for manual residency control.
+1. **Installs startup-time monkey patches** before any workflow nodes run.
+2. Ships **KJ-style resident loader nodes** for diffusion models and checkpoints.
+3. Maintains a **live residency registry** with preload / pin / evict / report controls for tracked objects.
+
+It is not just a “clean RAM” addon. The main target is the path from model file -> tensors -> live ComfyUI object -> VRAM retention.
 
 ## Why this exists
 
-Stock ComfyUI makes separate decisions for:
+ComfyUI’s default behavior mixes together two separate concerns:
 
-- where a model **lives after load**, and
-- where checkpoint tensors are **materialized first**.
+- **ingest path** — where tensors are first materialized while a model is being read, and
+- **residency policy** — where the finished model tends to live afterwards.
 
-Those are not the same thing.
+Those are not the same problem.
 
-This repo targets the second problem directly for `.safetensors` by steering eligible loads toward direct GPU ingest, narrowing resident diffusion-model loads down to UNet tensors only, then targets the first problem by overriding offload policy and by teaching `free_memory()` to protect high-priority sticky entries until the VRAM budget says otherwise.
+This repo focuses on both:
 
-## What is included
+- For **`.safetensors`**, it tries to keep eligible loads on the narrowest, most GPU-friendly path it can.
+- For **resident diffusion and checkpoint-model loads**, it avoids broad checkpoint materialization by selecting only the detected UNet keys where possible.
+- For **runtime VRAM pressure**, it adds a sticky-priority registry and teaches ComfyUI’s unload path to protect higher-value resident entries until enough VRAM must be reclaimed.
+- For **manual control**, it exposes nodes that let you preload, pin, evict, and inspect tracked models, CLIPs, and VAEs.
 
-### Startup patcher
+## What changes at startup
 
-Installed automatically from `__init__.py` when the custom node loads.
+`__init__.py` calls `startup.install_patches()`, which applies the monkey patches exactly once when the custom node is imported.
+
+### Patched functions / methods
 
 Current patch surface:
 
 - `comfy.utils.load_torch_file`
+- `comfy.clip_vision.load_torch_file` (redirected to the patched `comfy.utils.load_torch_file` when present)
 - `comfy.model_management.free_memory`
 - `comfy.model_management.load_models_gpu`
 - `comfy.model_management.unet_offload_device`
@@ -35,77 +44,349 @@ Current patch surface:
 - `comfy.model_management.text_encoder_device`
 - `comfy.model_management.vae_device`
 - `comfy.model_management.unet_inital_load_device`
+- `comfy.model_management.LoadedModel.model_unload`
+- `comfy.model_patcher.ModelPatcher.detach`
 - `comfy.sd.load_checkpoint_guess_config`
 - `comfy.sd.load_diffusion_model`
 - `comfy.sd.load_clip`
+- `comfy.sd.VAE.encode`
+- `comfy.sd.VAE.decode`
 - `comfy.clip_vision.load`
 - `comfy.controlnet.load_controlnet`
 - `comfy.diffusers_load.load_diffusers`
 
-### Loader nodes
+### What those patches do
 
-- **Diffusion Model Loader Resident**
-- **Checkpoint Loader Resident**
-- **Checkpoint Model Loader Resident**
-- **Checkpoint Clip Loader Resident**
-- **Checkpoint VAE Loader Resident**
-- **Diffusion Model Selector Resident**
+#### 1) `load_torch_file` becomes residency-aware
 
-`Diffusion Model Loader Resident` mirrors the relevant KJ diffusion-loader feature surface:
+The patched loader:
 
-- weight dtype override
-- compute dtype override
-- cublas-ops toggle
-- SageAttention override
-- fp16 accumulation toggle
-- optional extra-state-dict merge
+- detects the active load context (`model`, `clip`, `vae`, `checkpoint`, etc.),
+- picks an explicit GPU target device when the active policy wants GPU ingest,
+- attempts **direct safetensors reads** on the requested device,
+- falls back to **CPU read + tensor-by-tensor copy** if direct GPU safetensors loading fails,
+- still uses **CPU-first `torch.load()`** for pickle formats (`.ckpt`, `.pt`, `.pth`, `.bin`),
+- records the actual load method in the residency registry.
 
-On `.safetensors`, the resident diffusion-model path now reads only the detected UNet keys and merges only matching keys from any extra state dict. Repeated resident loads also reuse a live equivalent object when the source path and loader-relevant options still match.
+For safetensors loads happening inside a `model` / `clip` / `vae` context, it can select only the detected component keys from the file header instead of pulling the full file into memory first.
 
-Before a GPU-bound resident load needs fresh VRAM, the loader now estimates the upcoming footprint from the model or checkpoint file itself and trims only enough lower-priority residency to cover that request plus a small internal headroom margin. The existing sticky ordering and partial-unload preference stay intact. That decision lives in the loader path, not in a separate user-configured VRAM target node.
+#### 2) Loader contexts are attached to stock ComfyUI load paths
 
-### Residency nodes
+These stock paths are wrapped with registry context and output binding:
 
-- **Set Global Residency Policy**
-- **Registry Snapshot**
-- **Pin Model/CLIP/VAE Residency**
-- **Preload Model/CLIP/VAE To GPU**
-- **Evict Model/CLIP/VAE From GPU**
-- **Report Model/CLIP/VAE Residency**
+- checkpoint loads,
+- diffusion-model loads,
+- CLIP loads,
+- CLIP Vision loads,
+- ControlNet loads,
+- diffusers loads.
+
+That means the registry is not limited to the custom resident nodes. Stock ComfyUI loaders that pass through these paths are also tracked.
+
+#### 3) Device/offload policy is overridden
+
+Depending on the active policy, the patcher can steer:
+
+- initial UNet load device,
+- CLIP/Text Encoder device,
+- VAE device,
+- offload devices for UNet / CLIP / VAE.
+
+This is how `prefer_gpu` and `sticky_gpu` keep more of the hot path on the GPU side than stock ComfyUI would.
+
+#### 4) `free_memory()` becomes sticky-aware
+
+Under `sticky_gpu`, `comfy.model_management.free_memory()` is patched so that:
+
+- sticky tracked wrappers are considered first,
+- higher-priority sticky entries are protected first,
+- lower-priority or older sticky entries yield first when VRAM must be reclaimed,
+- a transient protection floor is applied so ComfyUI does not immediately tear down high-value resident entries for small requests.
+
+#### 5) Clone replacement is hardened
+
+`load_models_gpu()` is patched to fully unload clone-conflict wrappers before replacement instead of relying on a shallow detach path that can leave base weights patched.
+
+#### 6) Unload / detach is redirected to CPU when needed
+
+`LoadedModel.model_unload()` and `ModelPatcher.detach()` are patched so that unloads which would otherwise not reclaim VRAM are redirected through a CPU offload target first.
+
+#### 7) VAE encode/decode gets a sticky-safe path
+
+Under `sticky_gpu`, patched `VAE.encode()` and `VAE.decode()`:
+
+- cap the working batch count when necessary to preserve transient VRAM headroom, and
+- retry with tiled VAE encode/decode on OOM.
+
+That behavior is not a general performance feature toggle. It exists to reduce avoidable VRAM spikes while sticky residency is active.
 
 ## Policies
 
-The startup patcher exposes four policies:
+The registry exposes four global policies:
 
-- `legacy` — leave ingest/offload behavior close to stock ComfyUI.
-- `balanced` — keep the registry and diagnostics, but do not aggressively steer ingest to GPU.
-- `prefer_gpu` — prefer GPU ingest, keep UNet/ControlNet/CLIP on the faster side of the device policy, but do not auto-pin tracked objects.
-- `sticky_gpu` — prefer GPU ingest, auto-pin the highest-value tracked outputs, and let lower-priority sticky entries yield first when VRAM pressure rises.
+### `legacy`
 
-Default selection order:
+Stay closest to stock ComfyUI behavior. Registry tracking still exists, but the patcher does not aggressively steer ingest/offload toward the GPU path.
 
-1. `COMFYUI_GPU_RESIDENT_POLICY` environment variable, if set.
-2. `sticky_gpu` when `--gpu_only` is active.
-3. `sticky_gpu` when `--highvram` is active.
+### `balanced`
+
+Keep registry tracking and diagnostics without aggressive GPU residency behavior.
+
+### `prefer_gpu`
+
+Prefer GPU ingest for tracked model-like loads and keep the faster side of the device/offload policy for:
+
+- diffusion models,
+- CLIP / text encoders,
+- ControlNets.
+
+This policy does **not** auto-pin tracked objects.
+
+### `sticky_gpu`
+
+Builds on `prefer_gpu` and additionally:
+
+- auto-pins newly bound **models** and **CLIPs**,
+- keeps **VAE offload** on the GPU side as well,
+- patches `free_memory()` to protect sticky tracked wrappers by priority,
+- uses the sticky-safe VAE encode/decode behavior.
+
+### Default policy selection
+
+Selection order is:
+
+1. `COMFYUI_GPU_RESIDENT_POLICY`, if set to a supported value.
+2. `sticky_gpu` when ComfyUI is started with `--gpu_only`.
+3. `sticky_gpu` when ComfyUI is started with `--highvram`.
 4. otherwise `prefer_gpu`.
 
-## Important scope limits
+Supported values are:
 
-### Best path: `.safetensors`
+- `legacy`
+- `balanced`
+- `prefer_gpu`
+- `sticky_gpu`
 
-This repo is optimized around `.safetensors`.
+## Included nodes
 
-Direct GPU ingest is attempted for `.safetensors` loads. Resident diffusion-model loads take a header-first selective path and fetch only the detected UNet tensors instead of loading the whole file and filtering later. If the direct path fails, the patcher falls back to CPU read + GPU copy and records that fallback in the registry.
+All nodes live under the `GPU Resident Loader` category.
 
-### `.ckpt` / `.pt` remain CPU-first under PyTorch
+### Loader nodes
 
-Those formats still go through `torch.load()`. The repo tracks that path and can still keep the resulting model hot in VRAM, but it does **not** claim true direct-to-GPU checkpoint ingest for pickle-based formats. Resident checkpoint nodes now warn about this when a GPU-resident policy is active so the compatibility path is not mistaken for the fast path.
+#### Diffusion Model Selector Resident
 
-Use the included conversion helper to migrate hot models to `.safetensors`.
+Returns an absolute path string for a selected diffusion model.
+
+Notes:
+
+- resolves from `diffusion_models`, and
+- also exposes `text_encoders` entries whose filename contains `connector`.
+
+#### Diffusion Model Loader Resident
+
+KJ-style diffusion-model loader with these controls:
+
+- `weight_dtype`
+- `compute_dtype`
+- `patch_cublaslinear`
+- `sage_attention`
+- `enable_fp16_accumulation`
+- optional `extra_state_dict`
+- optional `policy_override`
+
+Behavior:
+
+- for `.safetensors`, it loads only the detected UNet portion of the file,
+- if `extra_state_dict` is provided, only matching UNet keys are merged,
+- repeated loads reuse a live equivalent model when the source path and loader-relevant options still match,
+- before GPU-bound loads, it estimates the upcoming footprint and trims only enough lower-priority residency to cover the request plus adaptive headroom.
+
+#### Checkpoint Loader Resident
+
+Full checkpoint loader that returns:
+
+- `MODEL`
+- `CLIP`
+- `VAE`
+
+Behavior:
+
+- shares the same tuning knobs as the resident diffusion-model loader for the model component,
+- reuses already-live equivalent components when possible,
+- composes the final output from model / clip / vae component loaders instead of always rebuilding the whole checkpoint path from scratch.
+
+#### Checkpoint Model Loader Resident
+
+Model-only checkpoint loader.
+
+Behavior:
+
+- takes the same selective safetensors UNet fast path as the diffusion-model loader,
+- reuses a live equivalent model when available,
+- uses the same dtype / attention / cublas / fp16-accumulation knobs as the full checkpoint loader.
+
+#### Checkpoint Clip Loader Resident
+
+CLIP-only checkpoint loader.
+
+Behavior:
+
+- can reuse a live equivalent CLIP object,
+- avoids rebuilding the diffusion model and VAE outputs when only CLIP is needed.
+
+#### Checkpoint VAE Loader Resident
+
+VAE-only checkpoint loader.
+
+Behavior:
+
+- can reuse a live equivalent VAE object,
+- avoids rebuilding the diffusion model and CLIP outputs when only VAE is needed.
+
+### Residency nodes
+
+#### Set Global Residency Policy
+
+Sets the active global policy and returns it as a `STRING`.
+
+The loader nodes also expose an optional `policy_override` string input for one-off loads.
+
+#### Registry Snapshot
+
+Returns the whole registry as formatted JSON.
+
+#### Pin Model Residency / Pin CLIP Residency / Pin VAE Residency
+
+Marks a tracked object as sticky or non-sticky and optionally changes its priority.
+
+#### Preload Model To GPU / Preload CLIP To GPU / Preload VAE To GPU
+
+Calls `load_models_gpu(..., force_full_load=True)` for the selected object, then updates sticky state / priority in the registry.
+
+#### Evict Model From GPU / Evict CLIP From GPU / Evict VAE From GPU
+
+Attempts to unload the selected object from the current loaded-model set.
+
+`unpatch_weights=True` performs a full unload path. When eviction succeeds, the node returns `evicted`; otherwise `not_loaded`.
+
+#### Report Model Residency / Report CLIP Residency / Report VAE Residency
+
+Returns a JSON report for a single tracked object.
+
+If the object is not currently bound in the registry, the node returns a JSON payload with `tracked: false`.
+
+## Adaptive trimming before resident loads
+
+The resident loaders now do load-scoped VRAM trimming themselves.
+
+Before a GPU-bound resident load, the loader estimates required bytes from:
+
+- the safetensors header when possible,
+- the detected checkpoint component subset when possible,
+- otherwise the source file size as a fallback.
+
+It then requests enough free VRAM for:
+
+- the estimated load size, plus
+- adaptive headroom.
+
+Current adaptive headroom policy:
+
+- ratio: `12.5%` of the estimated load,
+- floor: `256 MiB`,
+- ceiling: `1 GiB`.
+
+The trim path prefers to:
+
+- unload non-sticky entries first,
+- then lower-priority sticky entries,
+- preserve explicitly kept models,
+- use partial unload where available.
+
+This logic lives in the resident loader path. You do not need a separate “target free VRAM” node for it.
+
+## Registry and observability
+
+The registry tracks residency metadata for bound objects.
+
+Typical per-entry fields include:
+
+- `entry_id`
+- `kind`
+- `source_path`
+- `basename`
+- `sticky`
+- `priority`
+- `created_at`
+- `last_touched`
+- `loaded_bytes`
+- `total_bytes`
+- `load_device`
+- `offload_device`
+- `current_device`
+- `last_method`
+- `last_report`
+- `loader_key`
+- `notes`
+- `alive`
+
+The `last_method` / `last_report` fields let you see whether a load actually used:
+
+- direct safetensors GPU ingest,
+- safetensors CPU -> CUDA fallback,
+- safetensors component-only load,
+- CPU-first `torch.load()` compatibility path,
+- or a recorded load failure.
+
+## What gets tracked
+
+Tracked/bound paths include:
+
+- resident node loads from this repo,
+- stock checkpoint loads,
+- stock diffusion-model loads,
+- stock CLIP loads,
+- stock CLIP Vision loads,
+- stock diffusers loads.
+
+ControlNet loads also participate in the patched load context and device-policy path, but this repo does not currently expose dedicated ControlNet residency nodes.
+
+## Important limits and non-goals
+
+### Best path is still `.safetensors`
+
+The narrow fast path is built around `.safetensors`.
+
+That is where this repo can:
+
+- inspect headers cheaply,
+- select only model / clip / vae subsets,
+- estimate component bytes more accurately,
+- attempt direct device-targeted reads.
+
+### `.ckpt` / `.pt` / pickle formats are still CPU-first
+
+For pickle-based formats, PyTorch still goes through `torch.load()` on CPU first.
+
+The repo can still:
+
+- track those loads,
+- keep the resulting live objects resident,
+- reuse equivalent live objects later.
+
+It does **not** claim direct-to-GPU ingest for those formats.
 
 ### Cross-process persistence is out of scope
 
-This repo does **not** keep VRAM contents alive after ComfyUI or WSL exits. CUDA memory lifetime is process/context scoped. Achieving persistence across process shutdown requires a long-lived keeper process or server that owns the CUDA context.
+This repo does **not** keep VRAM allocations alive after ComfyUI, Python, or WSL exits.
+
+CUDA memory lifetime is process/context scoped. True persistence across process shutdown would need a separate long-lived keeper process or service that owns the CUDA context.
+
+### It does not automatically capture arbitrary custom loader implementations
+
+The registry only sees objects that pass through the patched ComfyUI load paths or through this repo’s resident nodes.
+
+If another custom node loads models through its own private code path and bypasses those patched entry points, that object may never become a tracked registry entry. In that case, the preload / pin / evict / report nodes from this repo cannot manage it until that external loader is integrated or patched.
 
 ## Installation
 
@@ -115,67 +396,68 @@ Clone into `custom_nodes`:
 git clone https://github.com/xmarre/ComfyUI-GPU-Resident-Loader ComfyUI/custom_nodes/ComfyUI-GPU-Resident-Loader
 ```
 
-Install dependencies inside the same Python environment ComfyUI uses:
+Install dependencies into the same Python environment ComfyUI uses:
 
 ```bash
 pip install -r ComfyUI/custom_nodes/ComfyUI-GPU-Resident-Loader/requirements.txt
 ```
 
-Optional SageAttention dependencies are **not** installed by default. Install those separately if you plan to use the SageAttention loader modes.
+Requirements declared by the repo:
 
-## Basic usage
+- Python `>=3.10`
+- `safetensors>=0.4.3`
 
-### For direct diffusion-model loading
+Optional SageAttention dependencies are **not** installed by default. Install those separately if you plan to use a SageAttention mode in the resident loaders.
 
-Use **Diffusion Model Loader Resident**.
+## Basic usage patterns
 
-Recommended on a large VRAM machine:
+### 1) Large-VRAM, mostly resident workflow
 
-- policy: `sticky_gpu`
-- model format: `.safetensors`
-- preload with **Preload Model To GPU**
-- inspect with **Report Model Residency** or **Registry Snapshot**
+Recommended baseline:
 
-### For full checkpoints
+- start ComfyUI with `--highvram` or set policy manually to `sticky_gpu`,
+- prefer `.safetensors` for hot models,
+- load diffusion models through **Diffusion Model Loader Resident**,
+- use **Preload ... To GPU** for models you know you will reuse,
+- inspect with **Report ... Residency** or **Registry Snapshot**.
 
-Use **Checkpoint Loader Resident**.
+### 2) Full checkpoint workflow
 
-That tracks and binds the resulting diffusion model, CLIP, and VAE independently so they appear in the registry snapshot. If an equivalent live model, CLIP, or VAE already exists, the loader reuses it instead of rebuilding it.
+Use **Checkpoint Loader Resident** when you want `MODEL + CLIP + VAE` together.
 
-### For staged checkpoint loads
+That path can reuse already-live components instead of always rebuilding all three outputs.
+
+### 3) Staged checkpoint workflow
+
+Use component loaders when the graph does not need the whole checkpoint at once:
+
+- **Checkpoint Model Loader Resident** for diffusion model only,
+- **Checkpoint Clip Loader Resident** for CLIP only,
+- **Checkpoint VAE Loader Resident** for VAE only.
+
+### 4) Manual residency control
 
 Use:
 
-- **Checkpoint Model Loader Resident** when the workflow only needs the diffusion model
-- **Checkpoint Clip Loader Resident** when the workflow only needs the text encoder
-- **Checkpoint VAE Loader Resident** when the workflow only needs the VAE
+- **Pin ... Residency** to mark a tracked entry sticky / non-sticky,
+- **Preload ... To GPU** to force a full live load now,
+- **Evict ... From GPU** to unload it from the current loaded-model set.
 
-The model-only checkpoint node takes the same selective safetensors UNet fast path as the diffusion-model loader. CLIP-only and VAE-only nodes still use ComfyUI's checkpoint construction logic, but they avoid materializing the other outputs and can reuse an already-live equivalent object.
+## Notes on compatibility and migration
 
-### For manual residency control
+### Legacy wiring: `extra_state_dict` used as a policy string
 
-- use **Pin ... Residency** to mark a tracked object sticky or evictable
-- use **Preload ... To GPU** to fully materialize it in VRAM immediately
-- use **Evict ... From GPU** to unload it from the current loaded-model set
+The resident diffusion-model loader contains a compatibility shim for older graphs:
 
-## Observability
+- if `extra_state_dict` receives one of the known policy names,
+- and that value is **not** an existing file path,
+- it is interpreted as `policy_override` instead.
 
-Every tracked load stores:
+New graphs should connect policy strings to **`policy_override`**, not to `extra_state_dict`.
 
-- source path
-- last load method
-- requested device
-- actual device
-- sticky flag
-- current loaded bytes
-- total bytes
-- current/offload/load device
+### Convert hot pickle checkpoints to safetensors
 
-That data is surfaced through the report nodes and the registry snapshot node.
-
-## Conversion helper
-
-`scripts/convert_checkpoint_to_safetensors.py` is included for one-time conversion of hot `.ckpt` / `.pt` files into `.safetensors`.
+`scripts/convert_checkpoint_to_safetensors.py` is included for one-time conversion of hot `.ckpt` / `.pt` / `.pth` style checkpoints.
 
 Example:
 
@@ -185,8 +467,13 @@ python ComfyUI/custom_nodes/ComfyUI-GPU-Resident-Loader/scripts/convert_checkpoi
   --output /path/to/model.safetensors
 ```
 
+Optional flags:
+
+- `--state-dict-key <key>` to extract a different top-level dict key
+- `--allow-non-tensor-values` to skip non-tensor entries instead of failing
+
 ## License
 
 GPL-3.0-or-later.
 
-This repo intentionally stays GPL-compatible because it adapts behavior from GPL-licensed ComfyUI and mirrors feature behavior from the GPL-3.0-licensed KJNodes diffusion loader.
+This repo stays GPL-compatible because it adapts behavior from GPL-licensed ComfyUI and mirrors relevant loader behavior from GPL-3.0-licensed KJNodes.
