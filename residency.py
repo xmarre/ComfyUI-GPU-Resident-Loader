@@ -455,10 +455,10 @@ class ResidencyRegistry:
     def entry_for_object(self, obj: Any) -> ResidencyEntry | None:
         if obj is None:
             return None
-        entry_id = self._entry_id_for_object(obj)
-        if entry_id is None:
-            return None
         with self._lock:
+            entry_id = self._entry_id_for_object(obj)
+            if entry_id is None:
+                return None
             return self._entries.get(entry_id)
 
     def set_sticky(self, obj: Any, sticky: bool, priority: int | None = None) -> ResidencyEntry | None:
