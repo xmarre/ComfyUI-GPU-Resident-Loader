@@ -436,15 +436,26 @@ class ResidencyRegistry:
             entry.last_touched = _now()
             return obj
 
+    def _entry_id_for_object(self, obj: Any) -> str | None:
+        current = obj
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            entry_id = getattr(current, "__gpu_resident_loader_entry_id__", None)
+            if entry_id is None:
+                try:
+                    entry_id = self._object_to_entry.get(current)
+                except TypeError:
+                    entry_id = None
+            if entry_id is not None:
+                return entry_id
+            current = getattr(current, "parent", None)
+        return None
+
     def entry_for_object(self, obj: Any) -> ResidencyEntry | None:
         if obj is None:
             return None
-        entry_id = getattr(obj, "__gpu_resident_loader_entry_id__", None)
-        if entry_id is None:
-            try:
-                entry_id = self._object_to_entry.get(obj)
-            except TypeError:
-                entry_id = None
+        entry_id = self._entry_id_for_object(obj)
         if entry_id is None:
             return None
         with self._lock:
