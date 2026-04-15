@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from typing import Any
 
 import comfy.model_management as model_management
@@ -31,6 +32,69 @@ def _safe_is_dead(loaded) -> bool:
         return loaded.is_dead()
     except Exception:
         return False
+
+
+def _device_matches(device_a, device_b) -> bool:
+    normalized_a = _normalize_trim_device(device_a)
+    normalized_b = _normalize_trim_device(device_b)
+    if normalized_a is None or normalized_b is None:
+        return False
+    if isinstance(normalized_a, torch.device) and isinstance(normalized_b, torch.device):
+        if normalized_a.type != normalized_b.type:
+            return False
+        if normalized_a.type == "cuda":
+            index_a = 0 if normalized_a.index is None else normalized_a.index
+            index_b = 0 if normalized_b.index is None else normalized_b.index
+            return index_a == index_b
+        return True
+    return str(normalized_a) == str(normalized_b)
+
+
+def _should_force_cpu_offload(model: Any, *, active_device=None, force: bool = False) -> bool:
+    if force:
+        return True
+    active_device = _normalize_trim_device(active_device)
+    if not isinstance(active_device, torch.device) or active_device.type != "cuda":
+        return False
+    return _device_matches(active_device, getattr(model, "offload_device", None))
+
+
+@contextmanager
+def _temporary_offload_device(model: Any, device):
+    if model is None or device is None or not hasattr(model, "offload_device"):
+        yield
+        return
+
+    original_device = model.offload_device
+    model.offload_device = device
+    try:
+        yield
+    finally:
+        model.offload_device = original_device
+
+
+def unload_loaded_model(
+    loaded,
+    *,
+    active_device: str | torch.device | None = None,
+    force_offload_to_cpu: bool = False,
+    unpatch_weights: bool = True,
+) -> bool:
+    # This helper is intentionally scoped to full unloads owned by this plugin.
+    model = getattr(loaded, "model", None)
+    if model is None:
+        return False
+
+    active_device = _normalize_trim_device(active_device if active_device is not None else getattr(loaded, "device", None))
+    force_cpu_offload = _should_force_cpu_offload(
+        model,
+        active_device=active_device,
+        force=force_offload_to_cpu,
+    )
+    unload_target = torch.device("cpu") if force_cpu_offload else None
+
+    with _temporary_offload_device(model, unload_target):
+        return loaded.model_unload(None, unpatch_weights=unpatch_weights)
 
 
 def _sort_key_for_candidate(entry, *, sticky_respected: bool) -> tuple[int, int, float]:
