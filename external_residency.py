@@ -423,18 +423,18 @@ def _call_seedvr2_method_with_optional_expected_model(
     return method(*args, **kwargs)
 
 
-def _register_seedvr2_cached_model(global_cache: Any, *, kind: str, config: Any, model: Any) -> None:
+def _register_seedvr2_cached_model(global_cache: Any, *, kind: str, config: Any, model: Any) -> ExternalResidencyEntry | None:
     if not isinstance(config, Mapping):
         _LOG.debug(
             "GPU Resident Loader: skipping SeedVR2 %s cache entry with unexpected config type: %s",
             kind,
             type(config).__name__,
         )
-        return
+        return None
 
     node_id = config.get("node_id")
     if node_id is None or model is None:
-        return
+        return None
 
     try:
         model_ref = weakref.ref(model)
@@ -469,7 +469,7 @@ def _register_seedvr2_cached_model(global_cache: Any, *, kind: str, config: Any,
             )
         note = f"SeedVR2 cached VAE node {node_id}"
 
-    EXTERNAL_REGISTRY.bind(
+    return EXTERNAL_REGISTRY.bind(
         cache_key=cache_key,
         obj=model,
         kind=registry_kind,
@@ -497,6 +497,7 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
     original_remove_dit = None
     original_remove_vae = None
     provisional_cache_keys: set[str] = set()
+    provisional_cache_ownership: dict[str, str] = {}
 
     try:
         with _SEEDVR2_PATCH_CONDITION:
@@ -603,16 +604,32 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
                 model, config = entry
                 if model is not None:
                     if isinstance(config, Mapping) and config.get("node_id") is not None:
-                        provisional_cache_keys.add(_seedvr2_entry_key("dit", config.get("node_id")))
-                    _register_seedvr2_cached_model(global_cache, kind="dit", config=config, model=model)
+                        cache_key = _seedvr2_entry_key("dit", config.get("node_id"))
+                        provisional_cache_keys.add(cache_key)
+                        prior_entry_id = EXTERNAL_REGISTRY._cache_key_to_entry.get(cache_key)
+                    else:
+                        cache_key = None
+                        prior_entry_id = None
+                    registered_entry = _register_seedvr2_cached_model(global_cache, kind="dit", config=config, model=model)
+                    if cache_key is not None and registered_entry is not None:
+                        if prior_entry_id != registered_entry.entry_id:
+                            provisional_cache_ownership[cache_key] = registered_entry.entry_id
             for _node_id, entry in vae_items:
                 if not isinstance(entry, tuple) or len(entry) != 2:
                     continue
                 model, config = entry
                 if model is not None:
                     if isinstance(config, Mapping) and config.get("node_id") is not None:
-                        provisional_cache_keys.add(_seedvr2_entry_key("vae", config.get("node_id")))
-                    _register_seedvr2_cached_model(global_cache, kind="vae", config=config, model=model)
+                        cache_key = _seedvr2_entry_key("vae", config.get("node_id"))
+                        provisional_cache_keys.add(cache_key)
+                        prior_entry_id = EXTERNAL_REGISTRY._cache_key_to_entry.get(cache_key)
+                    else:
+                        cache_key = None
+                        prior_entry_id = None
+                    registered_entry = _register_seedvr2_cached_model(global_cache, kind="vae", config=config, model=model)
+                    if cache_key is not None and registered_entry is not None:
+                        if prior_entry_id != registered_entry.entry_id:
+                            provisional_cache_ownership[cache_key] = registered_entry.entry_id
         with _SEEDVR2_PATCH_CONDITION:
             _SEEDVR2_PATCHING_CLASS_IDS.discard(class_id)
             _SEEDVR2_PATCHED_CLASS_IDS.add(class_id)
@@ -626,8 +643,13 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
             exc_info=True,
         )
         for cache_key in provisional_cache_keys:
-            EXTERNAL_REGISTRY.remove(cache_key=cache_key)
-        with _SEEDVR2_PATCH_CONDITION:
+            created_entry_id = provisional_cache_ownership.get(cache_key)
+            if created_entry_id is not None:
+                with EXTERNAL_REGISTRY._lock:
+                    current_entry_id = EXTERNAL_REGISTRY._cache_key_to_entry.get(cache_key)
+                    if current_entry_id == created_entry_id:
+                        EXTERNAL_REGISTRY.remove(cache_key=cache_key)
+        with lock_context:
             if original_set_dit is not None:
                 model_cache_cls.set_dit = original_set_dit
             if original_set_vae is not None:
@@ -640,6 +662,7 @@ def _install_seedvr2_integration_for_module(module: Any) -> bool:
                 model_cache_cls.remove_dit = original_remove_dit
             if original_remove_vae is not None:
                 model_cache_cls.remove_vae = original_remove_vae
+        with _SEEDVR2_PATCH_CONDITION:
             _SEEDVR2_PATCHING_CLASS_IDS.discard(class_id)
             _SEEDVR2_PATCHED_CLASS_IDS.discard(class_id)
             _SEEDVR2_PATCHING_THREAD_IDS.pop(class_id, None)
