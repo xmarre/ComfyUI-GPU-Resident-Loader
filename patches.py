@@ -772,6 +772,7 @@ def _prepare_sticky_vae_batch(
                 sticky_floor_priority=0,
                 allow_partial_unload=True,
                 keep_models=(patcher,),
+                include_external=False,
             )
         except Exception as exc:
             _LOG.debug(
@@ -782,6 +783,30 @@ def _prepare_sticky_vae_batch(
             )
 
         free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
+        if free_memory < target_free and external_trim_enabled():
+            try:
+                trim_resident_vram(
+                    device=device,
+                    target_free_vram_bytes=target_free,
+                    respect_sticky=True,
+                    sticky_floor_priority=0,
+                    allow_partial_unload=True,
+                    keep_models=(patcher,),
+                    include_external=True,
+                )
+            except Exception as exc:
+                _LOG.debug(
+                    "GPU Resident Loader: second-chance external VAE trim failed for batch=%s load=%s bytes: %s",
+                    batch_memory_used,
+                    model_load_required,
+                    exc,
+                )
+            else:
+                _LOG.info(
+                    "GPU Resident Loader: native sticky VAE trim was insufficient; retried with external candidates enabled"
+                )
+
+            free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
         batch_budget = 0 if model_load_target is None else max(0, free_memory - model_load_target)
         batch_number = _sticky_safe_batch_number(
             batch_count=total_batch_count,
@@ -1502,7 +1527,7 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
         EXTERNAL_REGISTRY.refresh_runtime_state()
 
         for_dynamic = bool(kwargs.get("for_dynamic", args[0] if args else False))
-        if device is not None and not external_trim_enabled() and not for_dynamic:
+        if device is not None and external_trim_enabled() and not for_dynamic:
             fallback_target = memory_required
             if REGISTRY.get_policy() == "sticky_gpu":
                 fallback_target = max(fallback_target, _sticky_protection_target(memory_required, device))
