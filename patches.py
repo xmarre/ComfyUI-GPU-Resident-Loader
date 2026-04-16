@@ -686,6 +686,44 @@ def _sticky_vae_free_memory(*, device: Any, patcher: Any) -> int:
     return max(0, int(patcher.get_free_memory(device)))
 
 
+def _sticky_model_load_requirement(*, device: Any, models: tuple[Any, ...]) -> int | None:
+    import comfy.model_management as model_management
+
+    loaded_model_cls = getattr(model_management, "LoadedModel", None)
+    if device is None or loaded_model_cls is None:
+        return None
+
+    requested_models: set[Any] = set()
+    for model in models:
+        if model is None:
+            continue
+        requested_models.add(model)
+        additional_models = getattr(model, "model_patches_models", None)
+        if callable(additional_models):
+            try:
+                for additional in additional_models():
+                    if additional is not None:
+                        requested_models.add(additional)
+            except Exception:
+                pass
+
+    total_required = 0
+    for model in requested_models:
+        try:
+            loaded_model = loaded_model_cls(model)
+            total_required += max(0, int(loaded_model.model_memory_required(loaded_model.device)))
+        except Exception:
+            return None
+    return total_required
+
+
+def _sticky_model_load_target(model_load_required: int | None) -> int | None:
+    if model_load_required is None:
+        return None
+    required = max(0, int(model_load_required))
+    return (required * 11 + 9) // 10
+
+
 def _prepare_sticky_vae_batch(
     *,
     device: Any,
@@ -694,9 +732,12 @@ def _prepare_sticky_vae_batch(
     total_batch_count: int,
 ) -> tuple[int, int, bool]:
     free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
+    model_load_required = _sticky_model_load_requirement(device=device, models=(patcher,))
+    model_load_target = _sticky_model_load_target(model_load_required)
+    batch_budget = 0 if model_load_target is None else max(0, free_memory - model_load_target)
     batch_number = _sticky_safe_batch_number(
         batch_count=total_batch_count,
-        free_memory=free_memory,
+        free_memory=batch_budget,
         memory_used=total_memory_used,
         device=device,
     )
@@ -705,7 +746,11 @@ def _prepare_sticky_vae_batch(
     if REGISTRY.get_policy() != "sticky_gpu" or device is None:
         return batch_number, batch_memory_used, False
 
-    target_free = _sticky_protection_target(batch_memory_used, device)
+    target_free = (
+        free_memory + 1
+        if model_load_target is None
+        else model_load_target + _sticky_protection_target(batch_memory_used, device)
+    )
     if free_memory < target_free:
         try:
             trim_resident_vram(
@@ -717,25 +762,36 @@ def _prepare_sticky_vae_batch(
                 keep_models=(patcher,),
             )
         except Exception as exc:
-            _LOG.debug("GPU Resident Loader: proactive VAE trim failed for %s bytes: %s", batch_memory_used, exc)
+            _LOG.debug(
+                "GPU Resident Loader: proactive VAE trim failed for batch=%s load=%s bytes: %s",
+                batch_memory_used,
+                model_load_required,
+                exc,
+            )
 
         free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
+        batch_budget = 0 if model_load_target is None else max(0, free_memory - model_load_target)
         batch_number = _sticky_safe_batch_number(
             batch_count=total_batch_count,
-            free_memory=free_memory,
+            free_memory=batch_budget,
             memory_used=total_memory_used,
             device=device,
         )
         batch_memory_used = _scaled_batch_memory(total_memory_used, total_batch_count, batch_number)
-        target_free = _sticky_protection_target(batch_memory_used, device)
+        target_free = (
+            free_memory + 1
+            if model_load_target is None
+            else model_load_target + _sticky_protection_target(batch_memory_used, device)
+        )
 
     should_tile = free_memory < target_free and batch_number <= 1
     if should_tile:
         _LOG.info(
-            "GPU Resident Loader: skipping regular VAE pass and switching directly to tiled mode; free=%s target=%s batch_memory=%s",
+            "GPU Resident Loader: skipping regular VAE pass and switching directly to tiled mode; free=%s target=%s batch_memory=%s model_load=%s",
             free_memory,
             target_free,
             batch_memory_used,
+            model_load_required,
         )
     return batch_number, batch_memory_used, should_tile
 
