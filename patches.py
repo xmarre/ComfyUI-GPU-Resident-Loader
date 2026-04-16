@@ -1001,6 +1001,7 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
     - Protects a subset of sticky-loaded wrappers from unloading when calling the original function by adding them to `keep_loaded`.
     - After the original free-memory call, refreshes both REGISTRY and EXTERNAL_REGISTRY runtime state.
     - If external trimming is available and still needed, attempts a fallback trim that includes external residency.
+      Dynamic free-memory calls are excluded because Comfy reduces their effective target internally.
     
     Parameters:
         memory_required: Number of bytes the caller needs to free.
@@ -1070,7 +1071,8 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
         REGISTRY.refresh_runtime_state()
         EXTERNAL_REGISTRY.refresh_runtime_state()
 
-        if device is not None and not external_trim_enabled():
+        for_dynamic = bool(kwargs.get("for_dynamic", args[0] if args else False))
+        if device is not None and not external_trim_enabled() and not for_dynamic:
             fallback_target = memory_required
             if REGISTRY.get_policy() == "sticky_gpu":
                 fallback_target = max(fallback_target, _sticky_protection_target(memory_required, device))
