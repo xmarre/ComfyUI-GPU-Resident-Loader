@@ -403,6 +403,36 @@ def external_trim_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def external_objects_for_models(models: tuple[Any, ...] | list[Any]) -> tuple[Any, ...]:
+    """
+    Returns registered external objects that are part of any supplied model wrapper chain.
+
+    This lets callers preserve external cache entries when they are associated with a kept
+    model through wrapper indirection rather than exact object identity.
+    """
+    related_ids: set[int] = set()
+    for model in models:
+        for related in _iter_seedvr2_wrapper_chain(model):
+            related_ids.add(id(related))
+
+    if not related_ids:
+        return ()
+
+    EXTERNAL_REGISTRY.refresh_runtime_state()
+    matches: list[Any] = []
+    seen_ids: set[int] = set()
+    with EXTERNAL_REGISTRY._lock:
+        for entry in EXTERNAL_REGISTRY._entries.values():
+            obj = entry.object()
+            if obj is None:
+                continue
+            obj_id = id(obj)
+            if obj_id in related_ids and obj_id not in seen_ids:
+                matches.append(obj)
+                seen_ids.add(obj_id)
+    return tuple(matches)
+
+
 def _call_seedvr2_method_with_optional_expected_model(
     method: Callable[..., Any],
     *args: Any,

@@ -18,6 +18,7 @@ from .cleanup import (
     trim_resident_vram,
     unload_loaded_model,
 )
+from .external_residency import EXTERNAL_REGISTRY, external_objects_for_models, external_trim_enabled
 from .residency import (
     KIND_CHECKPOINT,
     KIND_CLIP,
@@ -992,6 +993,28 @@ def _wrap_model_patcher_detach(func: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Wraps a free-memory function to enforce sticky-GPU protection and external fallback trimming.
+    
+    When the registry policy is "sticky_gpu" and a device is provided, the wrapper:
+    - Reserves VRAM for sticky-loaded models by attempting a pre-trim to a computed protection target.
+    - Protects a subset of sticky-loaded wrappers from unloading when calling the original function by adding them to `keep_loaded`.
+    - After the original free-memory call, refreshes both REGISTRY and EXTERNAL_REGISTRY runtime state.
+    - If external trimming is available and still needed, attempts a fallback trim that includes external residency.
+      Dynamic free-memory calls are excluded because Comfy reduces their effective target internally.
+    
+    Parameters:
+        memory_required: Number of bytes the caller needs to free.
+        device: Target device for which memory is being freed (may be None).
+        keep_loaded: Iterable of loaded-wrapper objects that must be kept; the wrapper may extend this list with additional protected wrappers.
+    
+    Returns:
+        The value returned by the wrapped `func`.
+        
+    Notes:
+    - The wrapper may call `trim_resident_vram` and `model_management.get_free_memory`; exceptions from trimming or free-memory queries are caught and logged, not propagated.
+    - Side effects include invoking trims and refreshing runtime state on REGISTRY and EXTERNAL_REGISTRY.
+    """
     @functools.wraps(func)
     def wrapper(memory_required, device, keep_loaded=None, *args, **kwargs):
         import comfy.model_management as model_management
@@ -1046,6 +1069,42 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
         unloaded = func(memory_required, device, keep_loaded + protected_wrappers, *args, **kwargs)
 
         REGISTRY.refresh_runtime_state()
+        EXTERNAL_REGISTRY.refresh_runtime_state()
+
+        for_dynamic = bool(kwargs.get("for_dynamic", args[0] if args else False))
+        if device is not None and not external_trim_enabled() and not for_dynamic:
+            fallback_target = memory_required
+            if REGISTRY.get_policy() == "sticky_gpu":
+                fallback_target = max(fallback_target, _sticky_protection_target(memory_required, device))
+            try:
+                free_now = model_management.get_free_memory(device)
+            except Exception:
+                free_now = None
+            if free_now is not None and int(free_now) < int(fallback_target):
+                protected_models = tuple(
+                    model
+                    for model in (getattr(loaded_wrapper, "model", None) for loaded_wrapper in keep_loaded + protected_wrappers)
+                    if model is not None
+                )
+                keep_models = protected_models + external_objects_for_models(protected_models)
+                try:
+                    trim_resident_vram(
+                        device=device,
+                        target_free_vram_bytes=int(fallback_target),
+                        respect_sticky=True,
+                        sticky_floor_priority=0,
+                        allow_partial_unload=True,
+                        keep_models=keep_models,
+                        include_external=True,
+                    )
+                except Exception as exc:
+                    _LOG.debug(
+                        "GPU Resident Loader: external fallback trim failed for free_memory(%s): %s",
+                        memory_required,
+                        exc,
+                    )
+                REGISTRY.refresh_runtime_state()
+                EXTERNAL_REGISTRY.refresh_runtime_state()
         return unloaded
 
     return wrapper
