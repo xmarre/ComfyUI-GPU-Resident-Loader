@@ -690,8 +690,11 @@ def _sticky_model_load_requirement(*, device: Any, models: tuple[Any, ...]) -> i
     import comfy.model_management as model_management
 
     loaded_model_cls = getattr(model_management, "LoadedModel", None)
+    is_device_cpu = getattr(model_management, "is_device_cpu", None)
     if device is None or loaded_model_cls is None:
         return None
+    if callable(is_device_cpu) and is_device_cpu(device):
+        return 0
 
     requested_models: set[Any] = set()
     for model in models:
@@ -704,13 +707,22 @@ def _sticky_model_load_requirement(*, device: Any, models: tuple[Any, ...]) -> i
                 for additional in additional_models():
                     if additional is not None:
                         requested_models.add(additional)
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOG.debug(
+                    "GPU Resident Loader: failed to enumerate patched models for sticky VAE preflight: %s",
+                    exc,
+                )
+                return None
 
     total_required = 0
     for model in requested_models:
         try:
             loaded_model = loaded_model_cls(model)
+            loaded_device = getattr(loaded_model, "device", None)
+            if loaded_device != device:
+                continue
+            if callable(is_device_cpu) and is_device_cpu(loaded_device):
+                continue
             total_required += max(0, int(loaded_model.model_memory_required(loaded_model.device)))
         except Exception:
             return None
