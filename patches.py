@@ -772,6 +772,7 @@ def _prepare_sticky_vae_batch(
                 sticky_floor_priority=0,
                 allow_partial_unload=True,
                 keep_models=(patcher,),
+                include_external=True,
             )
         except Exception as exc:
             _LOG.debug(
@@ -779,6 +780,10 @@ def _prepare_sticky_vae_batch(
                 batch_memory_used,
                 model_load_required,
                 exc,
+            )
+        else:
+            _LOG.info(
+                "GPU Resident Loader: native sticky VAE trim was insufficient; retried with external candidates enabled"
             )
 
         free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
@@ -1502,7 +1507,7 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
         EXTERNAL_REGISTRY.refresh_runtime_state()
 
         for_dynamic = bool(kwargs.get("for_dynamic", args[0] if args else False))
-        if device is not None and not external_trim_enabled() and not for_dynamic:
+        if device is not None and external_trim_enabled() and not for_dynamic:
             fallback_target = memory_required
             if REGISTRY.get_policy() == "sticky_gpu":
                 fallback_target = max(fallback_target, _sticky_protection_target(memory_required, device))
