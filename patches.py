@@ -772,6 +772,7 @@ def _prepare_sticky_vae_batch(
                 sticky_floor_priority=0,
                 allow_partial_unload=True,
                 keep_models=(patcher,),
+                include_external=False,
             )
         except Exception as exc:
             _LOG.debug(
@@ -782,7 +783,7 @@ def _prepare_sticky_vae_batch(
             )
 
         free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
-        if free_memory < target_free:
+        if free_memory < target_free and external_trim_enabled():
             try:
                 trim_resident_vram(
                     device=device,
