@@ -130,6 +130,7 @@ def _trim_candidates(
     respect_sticky: bool,
     sticky_floor_priority: int,
     keep_models: tuple[Any, ...],
+    include_external: bool | None = None,
 ) -> list[tuple[Any, Any, bool, bool]]:
     candidates: list[tuple[Any, Any, bool, bool]] = []
     ensure_external_integrations_installed()
@@ -154,7 +155,8 @@ def _trim_candidates(
         )
         candidates.append((loaded, entry, sticky_respected, False))
 
-    if external_trim_enabled():
+    should_include_external = external_trim_enabled() if include_external is None else bool(include_external)
+    if should_include_external:
         for external_obj, entry, sticky_respected in EXTERNAL_REGISTRY.candidates(
             device=device,
             respect_sticky=respect_sticky,
@@ -175,6 +177,7 @@ def trim_resident_vram(
     sticky_floor_priority: int,
     allow_partial_unload: bool,
     keep_models: tuple[Any, ...] = (),
+    include_external: bool | None = None,
 ) -> dict[str, Any]:
     ensure_external_integrations_installed()
     cleanup_models_gc = getattr(model_management, "cleanup_models_gc", None)
@@ -203,6 +206,7 @@ def trim_resident_vram(
             respect_sticky=respect_sticky,
             sticky_floor_priority=sticky_floor_priority,
             keep_models=keep_models,
+            include_external=include_external,
         )
         if not candidates:
             stopped_reason = "no_candidates"
@@ -306,7 +310,7 @@ def trim_resident_vram(
         "respect_sticky": bool(respect_sticky),
         "sticky_floor_priority": int(sticky_floor_priority),
         "allow_partial_unload": bool(allow_partial_unload),
-        "external_trim_enabled": bool(external_trim_enabled()),
+        "external_trim_enabled": bool(external_trim_enabled() if include_external is None else include_external),
         "actions": actions,
     }
 
