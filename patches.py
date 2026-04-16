@@ -806,6 +806,183 @@ def _wrap_vae_encode(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _default_tiled_vae_axes(
+    *,
+    latent_dim: int,
+    extra_1d_channel: Any,
+    tile_x: int | None,
+    tile_y: int | None,
+    tile_t: int | None,
+    decode: bool,
+) -> tuple[int | None, int | None, int | None]:
+    if latent_dim == 3:
+        default_tile_x = 32 if decode else 512
+        default_tile_y = 32 if decode else 512
+        default_tile_t = 999 if decode else 9999
+    elif latent_dim == 1 or extra_1d_channel is not None:
+        default_tile_x = 256 * 2048
+        default_tile_y = None
+        default_tile_t = None
+    else:
+        default_tile_x = 64 if decode else 512
+        default_tile_y = 64 if decode else 512
+        default_tile_t = None
+
+    resolved_tile_x = default_tile_x if tile_x is None else max(1, int(tile_x))
+    resolved_tile_y = default_tile_y if tile_y is None else max(1, int(tile_y))
+    resolved_tile_t = default_tile_t if tile_t is None else max(1, int(tile_t))
+    return resolved_tile_x, resolved_tile_y, resolved_tile_t
+
+
+def _shape_with_capped_tail(shape: tuple[int, ...], tail_caps: dict[int, int | None]) -> tuple[int, ...]:
+    capped = list(shape)
+    for index, cap in tail_caps.items():
+        if cap is None:
+            continue
+        capped[index] = min(int(capped[index]), max(1, int(cap)))
+    return tuple(capped)
+
+
+def _tiled_vae_memory_shapes(
+    *,
+    shape: tuple[int, ...],
+    latent_dim: int,
+    extra_1d_channel: Any,
+    tile_x: int | None,
+    tile_y: int | None,
+    tile_t: int | None,
+    decode: bool,
+) -> list[tuple[int, ...]]:
+    resolved_tile_x, resolved_tile_y, resolved_tile_t = _default_tiled_vae_axes(
+        latent_dim=latent_dim,
+        extra_1d_channel=extra_1d_channel,
+        tile_x=tile_x,
+        tile_y=tile_y,
+        tile_t=tile_t,
+        decode=decode,
+    )
+
+    if latent_dim == 3:
+        return [
+            _shape_with_capped_tail(
+                shape,
+                {
+                    len(shape) - 3: resolved_tile_t,
+                    len(shape) - 2: resolved_tile_y,
+                    len(shape) - 1: resolved_tile_x,
+                },
+            )
+        ]
+
+    if latent_dim == 1 or extra_1d_channel is not None:
+        return [_shape_with_capped_tail(shape, {len(shape) - 1: resolved_tile_x})]
+
+    if decode:
+        return [
+            _shape_with_capped_tail(
+                shape,
+                {
+                    len(shape) - 2: resolved_tile_y,
+                    len(shape) - 1: resolved_tile_x,
+                },
+            )
+        ]
+
+    return [
+        _shape_with_capped_tail(
+            shape,
+            {
+                len(shape) - 2: resolved_tile_y,
+                len(shape) - 1: resolved_tile_x,
+            },
+        ),
+        _shape_with_capped_tail(
+            shape,
+            {
+                len(shape) - 2: max(1, resolved_tile_y // 2),
+                len(shape) - 1: max(1, resolved_tile_x * 2),
+            },
+        ),
+        _shape_with_capped_tail(
+            shape,
+            {
+                len(shape) - 2: max(1, resolved_tile_y * 2),
+                len(shape) - 1: max(1, resolved_tile_x // 2),
+            },
+        ),
+    ]
+
+
+@contextlib.contextmanager
+def _temporary_tiled_vae_memory_estimate(
+    self,
+    *,
+    decode: bool,
+    tile_x: int | None,
+    tile_y: int | None,
+    tile_t: int | None,
+) -> Any:
+    memory_attr = "memory_used_decode" if decode else "memory_used_encode"
+    original = getattr(self, memory_attr, None)
+    if not callable(original):
+        yield
+        return
+
+    def estimated(shape, dtype, *args, **kwargs):
+        shapes = _tiled_vae_memory_shapes(
+            shape=tuple(int(dim) for dim in shape),
+            latent_dim=int(getattr(self, "latent_dim", 2)),
+            extra_1d_channel=getattr(self, "extra_1d_channel", None),
+            tile_x=tile_x,
+            tile_y=tile_y,
+            tile_t=tile_t,
+            decode=decode,
+        )
+        return max(int(original(candidate, dtype, *args, **kwargs)) for candidate in shapes)
+
+    setattr(self, memory_attr, estimated)
+    try:
+        yield
+    finally:
+        setattr(self, memory_attr, original)
+
+
+def _wrap_vae_encode_tiled(func: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(func)
+    def wrapper(self, pixel_samples, tile_x=None, tile_y=None, overlap=None, tile_t=None, overlap_t=None):
+        if REGISTRY.get_policy() != "sticky_gpu":
+            return func(self, pixel_samples, tile_x=tile_x, tile_y=tile_y, overlap=overlap, tile_t=tile_t, overlap_t=overlap_t)
+
+        with _temporary_tiled_vae_memory_estimate(
+            self,
+            decode=False,
+            tile_x=tile_x,
+            tile_y=tile_y,
+            tile_t=tile_t,
+        ):
+            return func(self, pixel_samples, tile_x=tile_x, tile_y=tile_y, overlap=overlap, tile_t=tile_t, overlap_t=overlap_t)
+
+    return wrapper
+
+
+def _wrap_vae_decode_tiled(func: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(func)
+    def wrapper(self, samples, tile_x=None, tile_y=None, overlap=None, tile_t=None, overlap_t=None):
+        if REGISTRY.get_policy() != "sticky_gpu":
+            return func(self, samples, tile_x=tile_x, tile_y=tile_y, overlap=overlap, tile_t=tile_t, overlap_t=overlap_t)
+
+        with _temporary_tiled_vae_memory_estimate(
+            self,
+            decode=True,
+            tile_x=tile_x,
+            tile_y=tile_y,
+            tile_t=tile_t,
+        ):
+            return func(self, samples, tile_x=tile_x, tile_y=tile_y, overlap=overlap, tile_t=tile_t, overlap_t=overlap_t)
+
+    return wrapper
+
+
 def _wrap_vae_decode(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(self, samples_in, vae_options={}):
@@ -1227,6 +1404,14 @@ def install_patches() -> None:
     original_vae_decode = _remember_original("sd.VAE.decode", comfy_sd.VAE.decode)
     if comfy_sd.VAE.decode is original_vae_decode:
         comfy_sd.VAE.decode = _wrap_vae_decode(original_vae_decode)
+
+    original_vae_encode_tiled = _remember_original("sd.VAE.encode_tiled", comfy_sd.VAE.encode_tiled)
+    if comfy_sd.VAE.encode_tiled is original_vae_encode_tiled:
+        comfy_sd.VAE.encode_tiled = _wrap_vae_encode_tiled(original_vae_encode_tiled)
+
+    original_vae_decode_tiled = _remember_original("sd.VAE.decode_tiled", comfy_sd.VAE.decode_tiled)
+    if comfy_sd.VAE.decode_tiled is original_vae_decode_tiled:
+        comfy_sd.VAE.decode_tiled = _wrap_vae_decode_tiled(original_vae_decode_tiled)
 
     original_clip_vision_load = _remember_original("clip_vision.load", clip_vision.load)
     if clip_vision.load is original_clip_vision_load:
