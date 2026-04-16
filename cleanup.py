@@ -132,6 +132,25 @@ def _trim_candidates(
     keep_models: tuple[Any, ...],
     include_external: bool | None = None,
 ) -> list[tuple[Any, Any, bool, bool]]:
+    """
+    Collects and returns eviction/unload candidates from in-memory models and, optionally, external integrations.
+    
+    Filters currently loaded models by the given device, excludes dead or missing models, and skips models listed in `keep_models`. If `respect_sticky` is true, entries whose registry metadata mark them as sticky and whose priority meets or exceeds `sticky_floor_priority` are flagged so they are treated as higher-priority to keep. When `include_external` is true (or when `include_external` is None and external trimming is enabled), candidates from the external registry are included.
+    
+    Parameters:
+        device: Device filter for candidates; if not None only candidates matching this device are considered.
+        respect_sticky (bool): Whether to respect sticky registry entries when computing candidate priority.
+        sticky_floor_priority (int): Minimum priority value for a registry entry to be considered sticky.
+        keep_models (tuple[Any, ...]): Objects that must not be selected as candidates.
+        include_external (bool | None): If True include external-registry candidates; if False exclude them; if None defer to runtime external_trim_enabled().
+    
+    Returns:
+        list[tuple[Any, Any, bool, bool]]: A sorted list of tuples (candidate_obj, registry_entry_or_None, sticky_respected, is_external_candidate).
+        - candidate_obj: The loaded model object (internal) or the external object.
+        - registry_entry_or_None: Registry metadata for the candidate, or None if unavailable.
+        - sticky_respected: `True` when the candidate is marked sticky and meets `sticky_floor_priority`.
+        - is_external_candidate: `True` for candidates originating from the external registry.
+    """
     candidates: list[tuple[Any, Any, bool, bool]] = []
     ensure_external_integrations_installed()
     for loaded in list(model_management.current_loaded_models):
@@ -179,6 +198,36 @@ def trim_resident_vram(
     keep_models: tuple[Any, ...] = (),
     include_external: bool | None = None,
 ) -> dict[str, Any]:
+    """
+    Trim resident models (and optional external integration objects) until the requested amount of free VRAM is available or a stopping condition occurs.
+    
+    Tries to free GPU memory on `device` by evicting or unloading loaded models (and, optionally, external candidates). Respects sticky/priority hints, can perform partial unloads of pinned RAM when supported, and records each attempted action in the returned report.
+    
+    Parameters:
+        device (str | torch.device | None): Target device to free (defaults to model_management.get_torch_device()).
+        target_free_vram_bytes (int): Desired amount of free VRAM, in bytes.
+        respect_sticky (bool): If true, prefer protecting entries marked as sticky with sufficient priority.
+        sticky_floor_priority (int): Minimum priority required for a sticky entry to be respected.
+        allow_partial_unload (bool): If true, allow partial unloads and attempts to free pinned host RAM before full eviction.
+        keep_models (tuple[Any, ...]): Sequence of model objects that must not be unloaded (exact matches or recognized clones).
+        include_external (bool | None): If None, use external_trim_enabled() at runtime; otherwise force inclusion/exclusion of external candidates.
+    
+    Returns:
+        dict[str, Any]: Report of the trimming operation containing:
+            - status: "met_target", "partial", or "error".
+            - stopped_reason: reason the loop stopped (e.g., "target_met", "no_candidates", "no_progress", "error").
+            - target_met (bool): whether the target free VRAM was reached.
+            - device (str): string form of the device used.
+            - target_free_vram_bytes (int), free_before_bytes (int), free_after_bytes (int).
+            - freed_vram_bytes (int): total freed VRAM during this call.
+            - respect_sticky (bool), sticky_floor_priority (int), allow_partial_unload (bool).
+            - external_trim_enabled (bool): computed flag indicating whether external candidates were considered.
+            - actions (list[dict]): ordered per-candidate action records; each entry includes metadata such as
+              entry_id, basename, tracked, external_candidate, sticky_respected, priority,
+              need_before_bytes, loaded_before_bytes, freed_pinned_ram_bytes,
+              mode (e.g., "full_unload", "partial_unload", "external_evict", "error"),
+              loaded_after_bytes, freed_vram_bytes, free_after_bytes, and any warnings/errors.
+    """
     ensure_external_integrations_installed()
     cleanup_models_gc = getattr(model_management, "cleanup_models_gc", None)
     if callable(cleanup_models_gc):

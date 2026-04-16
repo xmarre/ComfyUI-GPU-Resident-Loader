@@ -993,6 +993,27 @@ def _wrap_model_patcher_detach(func: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Wraps a free-memory function to enforce sticky-GPU protection and external fallback trimming.
+    
+    When the registry policy is "sticky_gpu" and a device is provided, the wrapper:
+    - Reserves VRAM for sticky-loaded models by attempting a pre-trim to a computed protection target.
+    - Protects a subset of sticky-loaded wrappers from unloading when calling the original function by adding them to `keep_loaded`.
+    - After the original free-memory call, refreshes both REGISTRY and EXTERNAL_REGISTRY runtime state.
+    - If external trimming is available and still needed, attempts a fallback trim that includes external residency.
+    
+    Parameters:
+        memory_required: Number of bytes the caller needs to free.
+        device: Target device for which memory is being freed (may be None).
+        keep_loaded: Iterable of loaded-wrapper objects that must be kept; the wrapper may extend this list with additional protected wrappers.
+    
+    Returns:
+        The value returned by the wrapped `func`.
+        
+    Notes:
+    - The wrapper may call `trim_resident_vram` and `model_management.get_free_memory`; exceptions from trimming or free-memory queries are caught and logged, not propagated.
+    - Side effects include invoking trims and refreshing runtime state on REGISTRY and EXTERNAL_REGISTRY.
+    """
     @functools.wraps(func)
     def wrapper(memory_required, device, keep_loaded=None, *args, **kwargs):
         import comfy.model_management as model_management
