@@ -18,7 +18,7 @@ from .cleanup import (
     trim_resident_vram,
     unload_loaded_model,
 )
-from .external_residency import EXTERNAL_REGISTRY, external_trim_enabled
+from .external_residency import EXTERNAL_REGISTRY, external_objects_for_models, external_trim_enabled
 from .residency import (
     KIND_CHECKPOINT,
     KIND_CLIP,
@@ -1081,11 +1081,12 @@ def _wrap_free_memory(func: Callable[..., Any]) -> Callable[..., Any]:
             except Exception:
                 free_now = None
             if free_now is not None and int(free_now) < int(fallback_target):
-                keep_models = tuple(
+                protected_models = tuple(
                     model
                     for model in (getattr(loaded_wrapper, "model", None) for loaded_wrapper in keep_loaded + protected_wrappers)
                     if model is not None
                 )
+                keep_models = protected_models + external_objects_for_models(protected_models)
                 try:
                     trim_resident_vram(
                         device=device,
