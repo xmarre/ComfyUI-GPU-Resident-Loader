@@ -1063,12 +1063,24 @@ def _temporary_prefer_tiled_vae_encode(vae: Any):
 
 
 def _wrap_vae_encode_for_inpaint_node(func: Callable[..., Any]) -> Callable[..., Any]:
+    supported_kwargs = frozenset(inspect.signature(func).parameters)
+
     @functools.wraps(func)
-    def wrapper(self, vae, pixels, mask, grow_mask_by=6):
+    def wrapper(self, *args, **kwargs):
+        # Filter kwargs to only include those supported by the wrapped function
+        filtered_kwargs = {key: value for key, value in kwargs.items() if key in supported_kwargs}
+
+        # Supply default grow_mask_by if not present and supported
+        if "grow_mask_by" in supported_kwargs and "grow_mask_by" not in filtered_kwargs:
+            filtered_kwargs["grow_mask_by"] = 6
+
         if REGISTRY.get_policy() != "sticky_gpu":
-            return func(self, vae, pixels, mask, grow_mask_by=grow_mask_by)
+            return func(self, *args, **filtered_kwargs)
+
+        # Extract vae from args for the context manager
+        vae = args[0] if args else kwargs.get("vae")
         with _temporary_prefer_tiled_vae_encode(vae):
-            return func(self, vae, pixels, mask, grow_mask_by=grow_mask_by)
+            return func(self, *args, **filtered_kwargs)
 
     return wrapper
 
