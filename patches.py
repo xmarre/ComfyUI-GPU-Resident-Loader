@@ -668,14 +668,27 @@ def _scaled_batch_memory(total_memory_used: int, total_batch_count: int, batch_n
     return max(1, (total_memory * current_batch + total_batches - 1) // total_batches)
 
 
+def _sticky_vae_free_memory(*, device: Any, patcher: Any) -> int:
+    import comfy.model_management as model_management
+
+    get_free_memory = getattr(model_management, "get_free_memory", None)
+    if callable(get_free_memory):
+        try:
+            return max(0, int(get_free_memory(device)))
+        except Exception:
+            pass
+
+    return max(0, int(patcher.get_free_memory(device)))
+
+
 def _prepare_sticky_vae_batch(
     *,
     device: Any,
     patcher: Any,
     total_memory_used: int,
     total_batch_count: int,
-) -> tuple[int, bool]:
-    free_memory = int(patcher.get_free_memory(device))
+) -> tuple[int, int, bool]:
+    free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
     batch_number = _sticky_safe_batch_number(
         batch_count=total_batch_count,
         free_memory=free_memory,
@@ -685,7 +698,7 @@ def _prepare_sticky_vae_batch(
     batch_memory_used = _scaled_batch_memory(total_memory_used, total_batch_count, batch_number)
 
     if REGISTRY.get_policy() != "sticky_gpu" or device is None:
-        return batch_number, False
+        return batch_number, batch_memory_used, False
 
     target_free = _sticky_protection_target(batch_memory_used, device)
     if free_memory < target_free:
@@ -701,7 +714,7 @@ def _prepare_sticky_vae_batch(
         except Exception as exc:
             _LOG.debug("GPU Resident Loader: proactive VAE trim failed for %s bytes: %s", batch_memory_used, exc)
 
-        free_memory = int(patcher.get_free_memory(device))
+        free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
         batch_number = _sticky_safe_batch_number(
             batch_count=total_batch_count,
             free_memory=free_memory,
@@ -719,7 +732,7 @@ def _prepare_sticky_vae_batch(
             target_free,
             batch_memory_used,
         )
-    return batch_number, should_tile
+    return batch_number, batch_memory_used, should_tile
 
 
 def _wrap_vae_encode(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -741,8 +754,7 @@ def _wrap_vae_encode(func: Callable[..., Any]) -> Callable[..., Any]:
                 pixel_samples = pixel_samples.unsqueeze(2)
         try:
             memory_used = self.memory_used_encode(pixel_samples.shape, self.vae_dtype)
-            model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
-            batch_number, should_tile = _prepare_sticky_vae_batch(
+            batch_number, batch_memory_used, should_tile = _prepare_sticky_vae_batch(
                 device=self.device,
                 patcher=self.patcher,
                 total_memory_used=memory_used,
@@ -751,6 +763,11 @@ def _wrap_vae_encode(func: Callable[..., Any]) -> Callable[..., Any]:
             if should_tile:
                 do_tile = True
             else:
+                model_management.load_models_gpu(
+                    [self.patcher],
+                    memory_required=batch_memory_used,
+                    force_full_load=self.disable_offload,
+                )
                 samples = None
                 for x in range(0, pixel_samples.shape[0], batch_number):
                     pixels_in = self.process_input(pixel_samples[x:x + batch_number]).to(self.vae_dtype)
@@ -803,8 +820,7 @@ def _wrap_vae_decode(func: Callable[..., Any]) -> Callable[..., Any]:
             samples_in = samples_in[:, :, 0]
         try:
             memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
-            model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
-            batch_number, should_tile = _prepare_sticky_vae_batch(
+            batch_number, batch_memory_used, should_tile = _prepare_sticky_vae_batch(
                 device=self.device,
                 patcher=self.patcher,
                 total_memory_used=memory_used,
@@ -812,17 +828,21 @@ def _wrap_vae_decode(func: Callable[..., Any]) -> Callable[..., Any]:
             )
 
             preallocated = False
-            if not should_tile and getattr(self.first_stage_model, "comfy_has_chunked_io", False):
-                pixel_samples = torch.empty(
-                    self.first_stage_model.decode_output_shape(samples_in.shape),
-                    device=self.output_device,
-                    dtype=self.vae_output_dtype(),
-                )
-                preallocated = True
-
             if should_tile:
                 do_tile = True
             else:
+                model_management.load_models_gpu(
+                    [self.patcher],
+                    memory_required=batch_memory_used,
+                    force_full_load=self.disable_offload,
+                )
+                if getattr(self.first_stage_model, "comfy_has_chunked_io", False):
+                    pixel_samples = torch.empty(
+                        self.first_stage_model.decode_output_shape(samples_in.shape),
+                        device=self.output_device,
+                        dtype=self.vae_output_dtype(),
+                    )
+                    preallocated = True
                 for x in range(0, samples_in.shape[0], batch_number):
                     samples = samples_in[x:x + batch_number].to(device=self.device, dtype=self.vae_dtype)
                     if preallocated:
