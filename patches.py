@@ -1024,7 +1024,7 @@ def _should_prefer_tiled_vae_encode(vae: Any, pixel_samples: Any) -> bool:
 
 
 def _call_bound_tiled_vae(func: Callable[..., Any], pixel_samples: Any, *args: Any, **kwargs: Any) -> Any:
-    supported_kwargs = _tiled_vae_supported_kwargs(func)
+    supported_kwargs = _tiled_vae_supported_kwargs(getattr(func, "__func__", func))
     filtered_kwargs = {key: value for key, value in kwargs.items() if key in supported_kwargs}
     return func(pixel_samples, *args, **filtered_kwargs)
 
