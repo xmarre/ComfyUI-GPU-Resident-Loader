@@ -772,7 +772,6 @@ def _prepare_sticky_vae_batch(
                 sticky_floor_priority=0,
                 allow_partial_unload=True,
                 keep_models=(patcher,),
-                include_external=True,
             )
         except Exception as exc:
             _LOG.debug(
@@ -781,12 +780,32 @@ def _prepare_sticky_vae_batch(
                 model_load_required,
                 exc,
             )
-        else:
-            _LOG.info(
-                "GPU Resident Loader: native sticky VAE trim was insufficient; retried with external candidates enabled"
-            )
 
         free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
+        if free_memory < target_free:
+            try:
+                trim_resident_vram(
+                    device=device,
+                    target_free_vram_bytes=target_free,
+                    respect_sticky=True,
+                    sticky_floor_priority=0,
+                    allow_partial_unload=True,
+                    keep_models=(patcher,),
+                    include_external=True,
+                )
+            except Exception as exc:
+                _LOG.debug(
+                    "GPU Resident Loader: second-chance external VAE trim failed for batch=%s load=%s bytes: %s",
+                    batch_memory_used,
+                    model_load_required,
+                    exc,
+                )
+            else:
+                _LOG.info(
+                    "GPU Resident Loader: native sticky VAE trim was insufficient; retried with external candidates enabled"
+                )
+
+            free_memory = _sticky_vae_free_memory(device=device, patcher=patcher)
         batch_budget = 0 if model_load_target is None else max(0, free_memory - model_load_target)
         batch_number = _sticky_safe_batch_number(
             batch_count=total_batch_count,
