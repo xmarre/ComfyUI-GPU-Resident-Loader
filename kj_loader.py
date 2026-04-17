@@ -403,6 +403,26 @@ def _estimate_checkpoint_aux_component_bytes(ckpt_path: str, *, kind: str) -> in
     return int(estimated)
 
 
+def _env_bool(name: str) -> bool | None:
+    value = os.environ.get(name, "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _should_trim_before_load(*, effective_policy: str) -> bool:
+    env_override = _env_bool("COMFYUI_GPU_RESIDENT_LOAD_TRIM")
+    if env_override is not None:
+        return env_override
+    if effective_policy == "sticky_gpu":
+        return False
+    if getattr(args, "highvram", False) or getattr(args, "gpu_only", False):
+        return False
+    return True
+
+
 def _maybe_trim_before_load(
     *,
     loader_name: str,
@@ -410,7 +430,10 @@ def _maybe_trim_before_load(
     explicit_device: torch.device | None,
     required_bytes: int,
     keep_models: tuple[Any, ...] = (),
+    enabled: bool = True,
 ) -> None:
+    if not enabled:
+        return
     if explicit_device is None or explicit_device.type != "cuda":
         return
     if required_bytes <= 0:
@@ -632,6 +655,7 @@ def _load_resident_diffusion_model(
             extra_state_dict=extra_state_dict,
         ),
         keep_models=keep_models,
+        enabled=_should_trim_before_load(effective_policy=effective_policy),
     )
 
     with _temporary_backend_flags(
@@ -707,6 +731,7 @@ def _load_checkpoint_clip_only(
     is_safetensors = _is_safetensors_path(ckpt_path)
     header_info = checkpoint_component_info_from_header(ckpt_path) if is_safetensors else None
     model_config = None if header_info is None else header_info.get("model_config")
+    effective_policy = _effective_policy_name(policy_override)
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_CLIP, source_path=ckpt_path)
     _maybe_trim_before_load(
         loader_name=loader_name,
@@ -714,6 +739,7 @@ def _load_checkpoint_clip_only(
         explicit_device=explicit_device,
         required_bytes=_estimate_checkpoint_aux_component_bytes(ckpt_path, kind=KIND_CLIP),
         keep_models=keep_models,
+        enabled=_should_trim_before_load(effective_policy=effective_policy),
     )
     with REGISTRY.load_context(kind=KIND_CLIP, source_path=ckpt_path, explicit_device=explicit_device, cache_key=loader_key):
         if is_safetensors and model_config is None:
@@ -793,6 +819,7 @@ def _load_checkpoint_vae_only(
     is_safetensors = _is_safetensors_path(ckpt_path)
     header_info = checkpoint_component_info_from_header(ckpt_path) if is_safetensors else None
     model_config = None if header_info is None else header_info.get("model_config")
+    effective_policy = _effective_policy_name(policy_override)
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_VAE, source_path=ckpt_path)
     _maybe_trim_before_load(
         loader_name=loader_name,
@@ -800,6 +827,7 @@ def _load_checkpoint_vae_only(
         explicit_device=explicit_device,
         required_bytes=_estimate_checkpoint_aux_component_bytes(ckpt_path, kind=KIND_VAE),
         keep_models=keep_models,
+        enabled=_should_trim_before_load(effective_policy=effective_policy),
     )
     with REGISTRY.load_context(kind=KIND_VAE, source_path=ckpt_path, explicit_device=explicit_device, cache_key=loader_key):
         if is_safetensors and model_config is None:
