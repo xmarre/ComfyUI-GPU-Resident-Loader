@@ -395,12 +395,67 @@ def _estimate_model_load_bytes(
 
 
 def _estimate_checkpoint_aux_component_bytes(ckpt_path: str, *, kind: str) -> int:
+    """
+    Estimate the byte size of a specific checkpoint auxiliary component (e.g., CLIP or VAE).
+    
+    If `ckpt_path` is a safetensors file this attempts a component-specific estimate via
+    `estimate_checkpoint_component_bytes`. If that returns `None` or the file is not
+    safetensors, the function falls back to the file size on disk.
+    
+    Parameters:
+        ckpt_path (str): Path to the checkpoint file.
+        kind (str): Component kind to estimate (for example `"clip"`, `"vae"`, or other
+            checkpoint component identifiers accepted by `estimate_checkpoint_component_bytes`).
+    
+    Returns:
+        int: Estimated number of bytes required by the requested component.
+    """
     estimated = None
     if _is_safetensors_path(ckpt_path):
         estimated = estimate_checkpoint_component_bytes(ckpt_path, kind)
     if estimated is None:
         estimated = _fallback_file_size_bytes(ckpt_path)
     return int(estimated)
+
+
+def _env_bool(name: str) -> bool | None:
+    """
+    Parse a boolean-like environment variable value.
+    
+    Parameters:
+        name (str): Environment variable name to read.
+    
+    Returns:
+        bool | None: `True` if the variable value is one of "1", "true", "yes", or "on";
+        `False` if it is one of "0", "false", "no", or "off"; `None` if the variable is unset
+        or contains an unrecognized value.
+    """
+    value = os.environ.get(name, "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _should_trim_before_load(*, effective_policy: str) -> bool:
+    """
+    Decides whether to perform adaptive VRAM trimming before loading based on environment overrides, the effective residency policy, and runtime flags.
+    
+    Parameters:
+        effective_policy (str): The resolved residency policy name to evaluate (e.g., "sticky_gpu").
+    
+    Returns:
+        True if trimming should run before load, False otherwise.
+    """
+    env_override = _env_bool("COMFYUI_GPU_RESIDENT_LOAD_TRIM")
+    if env_override is not None:
+        return env_override
+    if effective_policy == "sticky_gpu":
+        return False
+    if getattr(args, "highvram", False) or getattr(args, "gpu_only", False):
+        return False
+    return True
 
 
 def _maybe_trim_before_load(
@@ -410,7 +465,26 @@ def _maybe_trim_before_load(
     explicit_device: torch.device | None,
     required_bytes: int,
     keep_models: tuple[Any, ...] = (),
+    enabled: bool = True,
 ) -> None:
+    """
+    Attempt to free GPU VRAM proactively to create headroom for a forthcoming load.
+    
+    If trimming is enabled and an explicit CUDA device is provided and `required_bytes` > 0,
+    calls the adaptive VRAM trimmer to free memory while preserving any `keep_models`.
+    Logs an informational message when memory was freed and a warning if the trimmer
+    could not reach the target headroom.
+    
+    Parameters:
+        loader_name (str): Short name used in log messages for the entity requesting the trim.
+        reason (str): Human-readable reason for the trim (included in logs).
+        explicit_device (torch.device | None): The explicit device to trim on; trimming is skipped if `None` or not CUDA.
+        required_bytes (int): Estimated number of bytes needed for the upcoming load; trimming is skipped if <= 0.
+        keep_models (tuple[Any, ...], optional): Objects to preserve from eviction while trimming (defaults to ()).
+        enabled (bool, optional): If `False`, the function is a no-op (defaults to True).
+    """
+    if not enabled:
+        return
     if explicit_device is None or explicit_device.type != "cuda":
         return
     if required_bytes <= 0:
@@ -601,6 +675,26 @@ def _load_resident_diffusion_model(
     policy_override: str | None = None,
     keep_models: tuple[Any, ...] = (),
 ) -> Any:
+    """
+    Load a diffusion model state dict from `source_path`, applying residency-aware VRAM trimming, optional extra UNet state merging, backend flags, and post-load model patches, and bind or reuse the resulting model for future loads.
+    
+    Parameters:
+        loader_name (str): Human-readable loader identifier used for logging.
+        cache_scope (str): Logical cache scope used when constructing the loader key.
+        source_path (str): Filesystem path to the diffusion model checkpoint.
+        note (str): Short note describing the load context (used when binding).
+        weight_dtype (str): Weight dtype selection used to build model options.
+        compute_dtype (str): Compute dtype selection applied to the loaded model.
+        patch_cublaslinear (bool): Whether to enable the cublas linear optimization during load.
+        sage_attention (str): SageAttention mode to apply to the model after loading.
+        enable_fp16_accumulation (bool): If true, enable fp16 accumulation backend flag during load.
+        extra_state_dict (str | None): Optional path to an additional state dict whose matching UNet keys will be merged into the main state dict.
+        policy_override (str | None): Optional residency policy override name (affects trimming decision).
+        keep_models (tuple[Any, ...]): Iterable of already-loaded objects whose residency should be preserved during trimming.
+    
+    Returns:
+        The loaded diffusion model object.
+    """
     model_options = _build_model_options(weight_dtype)
     effective_policy = _effective_policy_name(policy_override)
     loader_key = _make_loader_key(
@@ -632,6 +726,7 @@ def _load_resident_diffusion_model(
             extra_state_dict=extra_state_dict,
         ),
         keep_models=keep_models,
+        enabled=_should_trim_before_load(effective_policy=effective_policy),
     )
 
     with _temporary_backend_flags(
@@ -697,6 +792,20 @@ def _load_checkpoint_clip_only(
     loader_name: str,
     keep_models: tuple[Any, ...] = (),
 ):
+    """
+    Load or reuse the CLIP (text encoder) component from a checkpoint file.
+    
+    This resolves a loader cache key, attempts to reuse a previously loaded CLIP, and if absent loads the checkpoint (safetensors or torch format), optionally applies model-config-based extraction or older-quant conversion, constructs a CLIP object when weights are present, and binds the result for reuse.
+    
+    Parameters:
+        ckpt_path (str): Filesystem path to the checkpoint file.
+        policy_override (str | None): Optional residency policy override used to form the loader key.
+        loader_name (str): Human-readable name used in log messages and trimming decisions.
+        keep_models (tuple[Any, ...]): Sequence of model-like objects to preserve during any pre-load VRAM trimming.
+    
+    Returns:
+        clip (comfy.sd.CLIP | None): A constructed CLIP/text-encoder instance when weights are available, or `None` if no CLIP weights were found.
+    """
     loader_key = _checkpoint_component_loader_key("clip", policy_override)
     reused_clip = REGISTRY.lookup_live_object(kind=KIND_CLIP, source_path=ckpt_path, loader_key=loader_key)
     if reused_clip is not None:
@@ -707,6 +816,7 @@ def _load_checkpoint_clip_only(
     is_safetensors = _is_safetensors_path(ckpt_path)
     header_info = checkpoint_component_info_from_header(ckpt_path) if is_safetensors else None
     model_config = None if header_info is None else header_info.get("model_config")
+    effective_policy = _effective_policy_name(policy_override)
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_CLIP, source_path=ckpt_path)
     _maybe_trim_before_load(
         loader_name=loader_name,
@@ -714,6 +824,7 @@ def _load_checkpoint_clip_only(
         explicit_device=explicit_device,
         required_bytes=_estimate_checkpoint_aux_component_bytes(ckpt_path, kind=KIND_CLIP),
         keep_models=keep_models,
+        enabled=_should_trim_before_load(effective_policy=effective_policy),
     )
     with REGISTRY.load_context(kind=KIND_CLIP, source_path=ckpt_path, explicit_device=explicit_device, cache_key=loader_key):
         if is_safetensors and model_config is None:
@@ -783,6 +894,22 @@ def _load_checkpoint_vae_only(
     loader_name: str,
     keep_models: tuple[Any, ...] = (),
 ):
+    """
+    Load only the VAE component from a checkpoint, reusing a live VAE when available and binding the loaded VAE for reuse.
+    
+    Parameters:
+        ckpt_path (str): Filesystem path to the checkpoint (safetensors or torch file).
+        policy_override (str | None): Optional residency policy override used to resolve trimming/loading behavior.
+        loader_name (str): Human-readable name used in logging messages.
+        keep_models (tuple[Any, ...]): Objects to preserve from eviction when freeing VRAM before loading.
+    
+    Returns:
+        vae (comfy.sd.VAE | None): The loaded VAE object, or `None` if no VAE weights were found in the checkpoint.
+    
+    Side effects:
+        - May trigger adaptive VRAM trimming before loading depending on the effective policy and runtime flags.
+        - Binds the resulting VAE (if any) into the live-object registry for reuse.
+    """
     loader_key = _checkpoint_component_loader_key("vae", policy_override)
     reused_vae = REGISTRY.lookup_live_object(kind=KIND_VAE, source_path=ckpt_path, loader_key=loader_key)
     if reused_vae is not None:
@@ -793,6 +920,7 @@ def _load_checkpoint_vae_only(
     is_safetensors = _is_safetensors_path(ckpt_path)
     header_info = checkpoint_component_info_from_header(ckpt_path) if is_safetensors else None
     model_config = None if header_info is None else header_info.get("model_config")
+    effective_policy = _effective_policy_name(policy_override)
     explicit_device = REGISTRY.explicit_load_device(kind=KIND_VAE, source_path=ckpt_path)
     _maybe_trim_before_load(
         loader_name=loader_name,
@@ -800,6 +928,7 @@ def _load_checkpoint_vae_only(
         explicit_device=explicit_device,
         required_bytes=_estimate_checkpoint_aux_component_bytes(ckpt_path, kind=KIND_VAE),
         keep_models=keep_models,
+        enabled=_should_trim_before_load(effective_policy=effective_policy),
     )
     with REGISTRY.load_context(kind=KIND_VAE, source_path=ckpt_path, explicit_device=explicit_device, cache_key=loader_key):
         if is_safetensors and model_config is None:
